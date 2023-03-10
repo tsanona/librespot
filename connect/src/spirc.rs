@@ -352,7 +352,6 @@ impl Spirc {
 
         let device = initial_device_state(config);
 
-
         let player_events = player.as_ref().map(|p| p.get_player_event_channel());
 
         let mut task = SpircTask {
@@ -826,7 +825,7 @@ impl SpircTask {
                 }
 
                 if key == "autoplay" && old_value != new_value {
-                    if let Some(player) = &self.player{
+                    if let Some(player) = &self.player {
                         player.emit_auto_play_changed_event(matches!(new_value, "1"));
                     }
                 }
@@ -1014,7 +1013,10 @@ impl SpircTask {
         self.handle_stop();
 
         if let Some(player) = &self.player {
-            player.emit_session_disconnected_event(self.session.connection_id(), self.session.username());
+            player.emit_session_disconnected_event(
+                self.session.connection_id(),
+                self.session.username(),
+            );
         }
     }
 
@@ -1396,7 +1398,7 @@ impl SpircTask {
         // We will transition into autoplay after the latest track of this context.
         self.autoplay_context = false;
         self.resolve_context = Some(context_uri.to_owned());
-        
+
         if let Some(player) = &self.player {
             player.set_auto_normalise_as_album(context_uri.starts_with("spotify:album:"));
         }
@@ -1493,7 +1495,7 @@ impl SpircTask {
             Some((track, index)) => {
                 self.state.set_playing_track_index(index);
 
-                if let Some(player) = &mut self.player{
+                if let Some(player) = &mut self.player {
                     self.play_request_id = Some(player.load(track, start_playing, position_ms));
                 }
 
