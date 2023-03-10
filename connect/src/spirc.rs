@@ -84,6 +84,7 @@ struct SpircTask {
 
     ident: String,
     device: DeviceState,
+    active_device_ident: Option<String>,
     state: State,
     play_request_id: Option<u64>,
     play_status: SpircPlayStatus,
@@ -185,7 +186,7 @@ fn initial_device_state(config: ConnectConfig) -> DeviceState {
     let mut msg = DeviceState::new();
     msg.set_sw_version(version::SEMVER.to_string());
     msg.set_is_active(false);
-    msg.set_can_play(true);
+    msg.set_can_play(config.can_play);
     msg.set_volume(0);
     msg.set_name(config.name);
     msg.capabilities.push(int_capability(
@@ -364,6 +365,7 @@ impl Spirc {
 
             device,
             state: initial_state(),
+            active_device_ident: None,
             play_request_id: None,
             play_status: SpircPlayStatus::Stopped,
 
@@ -653,6 +655,12 @@ impl SpircTask {
                     trace!("Received SpircCommand::{:?}", cmd);
                     self.handle_activate();
                     self.notify(None)
+                },
+                SpircCommand::Pause => {
+                    let recepient = self.active_device_ident.clone().unwrap();
+                    let mut cs = CommandSender::new(self, MessageType::kMessageTypePause);
+                    cs = cs.recipient(&recepient);
+                    cs.send()
                 }
                 _ => {
                     warn!("SpircCommand::{:?} will be ignored while Not Active", cmd);
@@ -876,6 +884,8 @@ impl SpircTask {
             }
         }
 
+        info!("Recieved Update type: {:?} from {:?}", update.typ(), update.device_state.name());
+        info!("{update:?}");
         match update.typ() {
             MessageType::kMessageTypeHello => self.notify(Some(ident)),
 
@@ -1000,6 +1010,12 @@ impl SpircTask {
                     && self.device.became_active_at() <= update.device_state.became_active_at()
                 {
                     self.handle_disconnect();
+                }
+                if update.device_state.is_active() {
+                    self.state = update.state.get_or_default().to_owned();
+                    self.active_device_ident = Some(update.ident().to_owned());
+                    let active_device_name = update.device_state.name();
+                    info!("Device {active_device_name} is active!")
                 }
                 self.notify(None)
             }
@@ -1529,7 +1545,7 @@ impl SpircTask {
             return Ok(());
         }
 
-        trace!("Sending status to server: [{:?}]", status);
+        info!("Sending status to server: [{:?}]", status);
         let mut cs = CommandSender::new(self, MessageType::kMessageTypeNotify);
         if let Some(s) = recipient {
             cs = cs.recipient(s);

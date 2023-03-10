@@ -1318,6 +1318,7 @@ fn get_setup() -> Setup {
             device_type,
             initial_volume,
             has_volume_ctrl,
+            ..Default::default()
         }
     };
 
