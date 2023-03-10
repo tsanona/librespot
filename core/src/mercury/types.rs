@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{fmt, io::Write, str};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use protobuf::Message;
@@ -22,11 +22,26 @@ pub struct MercuryRequest {
     pub payload: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MercuryResponse {
     pub uri: String,
     pub status_code: i32,
     pub payload: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for MercuryResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let payload = self
+            .payload
+            .iter()
+            .map(|v| str::from_utf8(&v).unwrap())
+            .collect::<String>();
+        f.debug_struct("MercuryResponse")
+            .field("uri", &self.uri)
+            .field("status_code", &self.status_code)
+            .field("payload", &payload)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]

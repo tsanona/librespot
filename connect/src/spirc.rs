@@ -117,16 +117,35 @@ pub enum SpircCommand {
     Next,
     VolumeUp,
     VolumeDown,
-    Shutdown,
     Shuffle(bool),
     Repeat(bool),
-    Disconnect,
     SetPosition(u32),
     SetVolume(u16),
+    Shutdown,
+    Disconnect,
     Activate,
     Load(SpircLoadCommand),
 }
+impl TryFrom<SpircCommand> for MessageType {
+    type Error = SpircCommand;
 
+    fn try_from(cmd: SpircCommand) -> Result<Self, Self::Error> {
+        match cmd {
+            SpircCommand::Play => Ok(MessageType::kMessageTypePlay),
+            SpircCommand::Pause => Ok(MessageType::kMessageTypePause),
+            SpircCommand::Prev => Ok(MessageType::kMessageTypePrev),
+            SpircCommand::Next => Ok(MessageType::kMessageTypeNext),
+            SpircCommand::VolumeUp => Ok(MessageType::kMessageTypeVolumeUp),
+            SpircCommand::VolumeDown => Ok(MessageType::kMessageTypeVolumeDown),
+            SpircCommand::Shuffle(_) => Ok(MessageType::kMessageTypeShuffle),
+            SpircCommand::Repeat(_) => Ok(MessageType::kMessageTypeRepeat),
+            SpircCommand::SetPosition(_) => Ok(MessageType::kMessageTypeSeek),
+            SpircCommand::SetVolume(_) => Ok(MessageType::kMessageTypeVolume),
+            SpircCommand::Shutdown => Ok(MessageType::kMessageTypeGoodbye),
+            cmd => Err(cmd),
+        }
+    }
+}
 #[derive(Debug)]
 pub struct SpircLoadCommand {
     pub context_uri: String,
@@ -583,87 +602,69 @@ impl SpircTask {
     }
 
     fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
-        if matches!(cmd, SpircCommand::Shutdown) {
-            trace!("Received SpircCommand::Shutdown");
-            CommandSender::new(self, MessageType::kMessageTypeGoodbye).send()?;
-            self.handle_disconnect();
-            self.shutdown = true;
-            if let Some(rx) = self.commands.as_mut() {
-                rx.close()
+        match (cmd, self.device.is_active()) {
+            (SpircCommand::Shutdown, _) => {
+                trace!("Received SpircCommand::Shutdown");
+                CommandSender::new(self, SpircCommand::Shutdown.try_into().unwrap()).send()?;
+                self.handle_command(SpircCommand::Disconnect).and({
+                    self.shutdown = true;
+                    if let Some(rx) = self.commands.as_mut() {
+                        rx.close()
+                    };
+                    Ok(())
+                })
             }
-            Ok(())
-        } else if self.device.is_active() {
-            trace!("Received SpircCommand::{:?}", cmd);
-            match cmd {
-                SpircCommand::Play => {
-                    self.handle_play();
-                    self.notify(None)
-                }
-                SpircCommand::PlayPause => {
-                    self.handle_play_pause();
-                    self.notify(None)
-                }
-                SpircCommand::Pause => {
-                    self.handle_pause();
-                    self.notify(None)
-                }
-                SpircCommand::Prev => {
-                    self.handle_prev();
-                    self.notify(None)
-                }
-                SpircCommand::Next => {
-                    self.handle_next();
-                    self.notify(None)
-                }
-                SpircCommand::VolumeUp => {
-                    self.handle_volume_up();
-                    self.notify(None)
-                }
-                SpircCommand::VolumeDown => {
-                    self.handle_volume_down();
-                    self.notify(None)
-                }
-                SpircCommand::Disconnect => {
-                    self.handle_disconnect();
-                    self.notify(None)
-                }
-                SpircCommand::Shuffle(shuffle) => {
-                    self.state.set_shuffle(shuffle);
-                    self.notify(None)
-                }
-                SpircCommand::Repeat(repeat) => {
-                    self.state.set_repeat(repeat);
-                    self.notify(None)
-                }
-                SpircCommand::SetPosition(position) => {
-                    self.handle_seek(position);
-                    self.notify(None)
-                }
-                SpircCommand::SetVolume(volume) => {
-                    self.set_volume(volume);
-                    self.notify(None)
-                }
-                SpircCommand::Load(command) => {
-                    self.handle_load(&command.into())?;
-                    self.notify(None)
-                }
-                _ => Ok(()),
+            (SpircCommand::Disconnect, true) => {
+                self.handle_disconnect();
+                self.notify(None)
             }
-        } else {
-            match cmd {
-                SpircCommand::Activate => {
-                    trace!("Received SpircCommand::{:?}", cmd);
+            (SpircCommand::Disconnect, false) => {
+                info!("Cannot disconnect if it is not connected!");
+                Ok(())
+            }
+            (SpircCommand::Activate, is_active) => {
+                if !is_active {
+                    trace!("Received SpircCommand::Activete");
                     self.handle_activate();
                     self.notify(None)
-                },
-                SpircCommand::Pause => {
-                    let recepient = self.active_device_ident.clone().unwrap();
-                    let mut cs = CommandSender::new(self, MessageType::kMessageTypePause);
-                    cs = cs.recipient(&recepient);
-                    cs.send()
+                } else {
+                    warn!("Recived SpircCommand::Activete, while already active");
+                    Ok(())
                 }
-                _ => {
-                    warn!("SpircCommand::{:?} will be ignored while Not Active", cmd);
+            }
+            (cmd, true) => {
+                trace!("Received SpircCommand::{:?}", cmd);
+                match cmd {
+                    SpircCommand::Play => self.handle_play(),
+                    SpircCommand::PlayPause => self.handle_play_pause(),
+                    SpircCommand::Pause => self.handle_pause(),
+                    SpircCommand::Prev => self.handle_prev(),
+                    SpircCommand::Next => self.handle_next(),
+                    SpircCommand::VolumeUp => self.handle_volume_up(),
+                    SpircCommand::VolumeDown => self.handle_volume_down(),
+                    SpircCommand::Shuffle(shuffle) => self.state.set_shuffle(shuffle),
+                    SpircCommand::Repeat(repeat) => self.state.set_repeat(repeat),
+                    SpircCommand::SetPosition(position) => self.handle_seek(position),
+                    SpircCommand::SetVolume(volume) => self.set_volume(volume),
+                    SpircCommand::Load(command) => self.handle_load(&command.into())?,
+                    _ => return Ok(()),
+                }
+                self.notify(None)
+            }
+            (cmd, false) => {
+                if let Some(recepient) = self.active_device_ident.clone() {
+                    match cmd.try_into() {
+                        Ok(cmd) => {
+                            let mut cs = CommandSender::new(self, cmd);
+                            cs = cs.recipient(&recepient);
+                            cs.send()
+                        }
+                        Err(cmd) => {
+                            info!("Command {:?} is not implemented", cmd);
+                            Ok(())
+                        }
+                    }
+                } else {
                     Ok(())
                 }
             }
@@ -850,12 +851,11 @@ impl SpircTask {
         trace!("Received update frame: {:#?}", update);
 
         // First see if this update was intended for us.
-        let device_id = &self.ident;
-        let ident = update.ident();
-        if ident == device_id
-            || (!update.recipient.is_empty() && !update.recipient.contains(device_id))
+        let update_ident = update.ident();
+        if self.ident == update_ident
+            || (!update.recipient.is_empty() && !update.recipient.contains(&self.ident))
         {
-            return Err(SpircError::Ident(ident.to_string()).into());
+            return Err(SpircError::Ident(update_ident.to_string()).into());
         }
 
         let old_client_id = self.session.client_id();
@@ -887,7 +887,7 @@ impl SpircTask {
         info!("Recieved Update type: {:?} from {:?}", update.typ(), update.device_state.name());
         info!("{update:?}");
         match update.typ() {
-            MessageType::kMessageTypeHello => self.notify(Some(ident)),
+            MessageType::kMessageTypeHello => self.notify(Some(update_ident)),
 
             MessageType::kMessageTypeLoad => {
                 self.handle_load(update.state.get_or_default())?;

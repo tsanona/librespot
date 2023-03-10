@@ -1,20 +1,20 @@
-use std::{process::exit, io};
 use librespot::{
-    connect::{config::ConnectConfig, spirc::{Spirc}},
+    connect::{config::ConnectConfig, spirc::Spirc},
     core::{
         authentication::Credentials,
         config::{DeviceType, SessionConfig},
         session::Session,
     },
 };
+use std::{io, process::exit};
 //use dotenv;
 use env_logger;
-use log::{error, warn, LevelFilter, info};
+use log::{error, info, warn, LevelFilter};
 
 #[tokio::main]
 async fn main() {
     let mut builder = env_logger::Builder::new();
-    builder.filter_level(LevelFilter::Info);
+    builder.filter_level(LevelFilter::Debug);
     builder.init();
 
     let session_config = SessionConfig::default();
@@ -23,7 +23,7 @@ async fn main() {
         device_type: DeviceType::Observer,
         initial_volume: None,
         has_volume_ctrl: false,
-        can_play: false
+        can_play: false,
     };
 
     println!("Connecting...");
@@ -32,7 +32,15 @@ async fn main() {
 
     //session.connect(credentials.clone(), false).await.unwrap();
 
-    let (spirc_, spirc_task_) = match Spirc::new(connect_config, session.clone(), credentials.clone(), None, None).await {
+    let (spirc_, spirc_task_) = match Spirc::new(
+        connect_config,
+        session.clone(),
+        credentials.clone(),
+        None,
+        None,
+    )
+    .await
+    {
         Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
         Err(e) => {
             error!("could not initialize spirc: {}", e);
@@ -44,9 +52,8 @@ async fn main() {
 
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        info!("Sending PlayPause");
-        spirc.pause()
+        info!("Sending Pause");
+        spirc.play()
     });
     spirc_task.await
-    
 }

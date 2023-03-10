@@ -6,7 +6,7 @@ pub struct ConnectConfig {
     pub device_type: DeviceType,
     pub initial_volume: Option<u16>,
     pub has_volume_ctrl: bool,
-    pub can_play: bool
+    pub can_play: bool,
 }
 
 impl Default for ConnectConfig {
@@ -16,7 +16,7 @@ impl Default for ConnectConfig {
             device_type: DeviceType::default(),
             initial_volume: Some(50),
             has_volume_ctrl: true,
-            can_play: true
+            can_play: true,
         }
     }
 }
