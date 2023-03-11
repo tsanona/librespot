@@ -53,8 +53,8 @@ async fn main() {
         connect_config,
         session.clone(),
         credentials,
-        player,
-        Box::new(SoftMixer::open(MixerConfig::default())),
+        Some(player),
+        Some(Box::new(SoftMixer::open(MixerConfig::default()))),
     )
     .await
     .unwrap();

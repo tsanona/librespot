@@ -51,9 +51,53 @@ async fn main() {
     let spirc_task = Box::pin(spirc_task_);
 
     tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        println!("Sending Sending commands");
+        spirc.play_pause();
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        spirc.play_pause();
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        info!("Sending Pause");
-        spirc.play()
+        spirc.prev();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.next();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_down();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        spirc.volume_up();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.shuffle(true);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.shuffle(false);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.repeat(true);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.repeat(false);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.set_position_ms(60000);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.disconnect();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        spirc.shutdown();
     });
     spirc_task.await
 }
