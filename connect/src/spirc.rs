@@ -11,7 +11,7 @@ use futures_util::{stream::FusedStream, FutureExt, StreamExt};
 use protobuf::{self, Message};
 use rand::prelude::SliceRandom;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, mpsc::error::SendError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
@@ -155,6 +155,25 @@ pub struct SpircLoadCommand {
     pub repeat: bool,
     pub playing_track_index: u32,
     pub tracks: Vec<TrackRef>,
+}
+
+impl SpircLoadCommand {
+    fn from_state(state: State) -> Self {
+
+        SpircLoadCommand { 
+            context_uri: state.context_uri().to_string(), 
+            start_playing: {
+                if state.status() == PlayStatus::kPlayStatusPlay {
+                    true
+                } else {
+                    false
+                }
+            }, 
+            shuffle: state.shuffle(), 
+            repeat: state.repeat(), 
+            playing_track_index: state.playing_track_index(), 
+            tracks: state.track }
+    }
 }
 
 impl From<SpircLoadCommand> for State {
@@ -420,50 +439,50 @@ impl Spirc {
         Ok((spirc, task.run()))
     }
 
-    pub fn play(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Play)?)
+    pub fn play(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Play)
     }
-    pub fn play_pause(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::PlayPause)?)
+    pub fn play_pause(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::PlayPause)
     }
-    pub fn pause(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Pause)?)
+    pub fn pause(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Pause)
     }
-    pub fn prev(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Prev)?)
+    pub fn prev(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Prev)
     }
-    pub fn next(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Next)?)
+    pub fn next(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Next)
     }
-    pub fn volume_up(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::VolumeUp)?)
+    pub fn volume_up(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::VolumeUp)
     }
-    pub fn volume_down(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::VolumeDown)?)
+    pub fn volume_down(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::VolumeDown)
     }
-    pub fn shutdown(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Shutdown)?)
+    pub fn shutdown(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Shutdown)
     }
-    pub fn shuffle(&self, shuffle: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Shuffle(shuffle))?)
+    pub fn shuffle(&self, shuffle: bool) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Shuffle(shuffle))
     }
-    pub fn repeat(&self, repeat: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Repeat(repeat))?)
+    pub fn repeat(&self, repeat: bool) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Repeat(repeat))
     }
-    pub fn set_volume(&self, volume: u16) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::SetVolume(volume))?)
+    pub fn set_volume(&self, volume: u16) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::SetVolume(volume))
     }
-    pub fn set_position_ms(&self, position_ms: u32) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::SetPosition(position_ms))?)
+    pub fn set_position_ms(&self, position_ms: u32) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::SetPosition(position_ms))
     }
-    pub fn disconnect(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Disconnect)?)
+    pub fn disconnect(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Disconnect)
     }
-    pub fn activate(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Activate)?)
+    pub fn activate(&self) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Activate)
     }
-    pub fn load(&self, command: SpircLoadCommand) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Load(command))?)
+    pub fn load(&self, command: SpircLoadCommand) -> Result<(), SendError<SpircCommand>> {
+        self.commands.send(SpircCommand::Load(command))
     }
 }
 
@@ -586,61 +605,236 @@ impl SpircTask {
         }
     }
 
-    fn now_ms(&mut self) -> i64 {
-        let dur = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(dur) => dur,
-            Err(err) => err.duration(),
-        };
+    fn handle_remote_update(&mut self, update: Frame) -> Result<(), Error> {
+        trace!("Received update frame: {:#?}", update);
 
-        dur.as_millis() as i64 + 1000 * self.session.time_delta()
+        // First see if this update was intended for us.
+        let update_ident = update.ident();
+        if self.ident == update_ident
+            || (!update.recipient.is_empty() && !update.recipient.contains(&self.ident))
+        {
+            return Err(SpircError::Ident(update_ident.to_string()).into());
+        }
+
+        let old_client_id = self.session.client_id();
+
+        for entry in update.device_state.metadata.iter() {
+            match entry.type_() {
+                "client_id" => self.session.set_client_id(entry.metadata()),
+                "brand_display_name" => self.session.set_client_brand_name(entry.metadata()),
+                "model_display_name" => self.session.set_client_model_name(entry.metadata()),
+                _ => (),
+            }
+        }
+
+        self.session.set_client_name(update.device_state.name());
+
+        let new_client_id = self.session.client_id();
+
+        if self.device.is_active() && new_client_id != old_client_id {
+            if let Some(player) = &self.player {
+                player.emit_session_client_changed_event(
+                    new_client_id,
+                    self.session.client_name(),
+                    self.session.client_brand_name(),
+                    self.session.client_model_name(),
+                );
+            }
+        }
+
+        info!(
+            "Recieved Update type: {:?} from {:?}",
+            update.typ(),
+            update.device_state.name()
+        );
+        info!("{update:?}");
+        match update.typ() {
+            MessageType::kMessageTypeHello => self.notify(Some(update_ident)),
+
+            MessageType::kMessageTypeLoad => self.handle_command(SpircCommand::Load(SpircLoadCommand::from_state(update.state.get_or_default().to_owned()))),
+
+            MessageType::kMessageTypePlay => self.handle_command(SpircCommand::Play),
+
+            MessageType::kMessageTypePlayPause => self.handle_command(SpircCommand::PlayPause),
+
+            MessageType::kMessageTypePause => self.handle_command(SpircCommand::Pause),
+
+            MessageType::kMessageTypeNext => self.handle_command(SpircCommand::Next),
+
+            MessageType::kMessageTypePrev => self.handle_command(SpircCommand::Prev),
+
+            MessageType::kMessageTypeVolumeUp => self.handle_command(SpircCommand::VolumeUp),
+
+            MessageType::kMessageTypeVolumeDown => self.handle_command(SpircCommand::VolumeDown),
+
+            MessageType::kMessageTypeRepeat => {
+                let repeat = update.state.repeat();
+
+                if let Some(player) = &self.player {
+                    player.emit_repeat_changed_event(repeat);
+                }
+
+                self.handle_command(SpircCommand::Repeat(repeat))
+            }
+
+            MessageType::kMessageTypeShuffle => {
+                let shuffle = update.state.shuffle();
+                if shuffle {
+                    let current_index = self.state.playing_track_index();
+                    let tracks = &mut self.state.track;
+                    if !tracks.is_empty() {
+                        tracks.swap(0, current_index as usize);
+                        if let Some((_, rest)) = tracks.split_first_mut() {
+                            let mut rng = rand::thread_rng();
+                            rest.shuffle(&mut rng);
+                        }
+                        self.state.set_playing_track_index(0);
+                    }
+                }
+                if let Some(player) = &self.player {
+                    player.emit_shuffle_changed_event(shuffle);
+                }
+                self.handle_command(SpircCommand::Shuffle(shuffle))
+            }
+
+            MessageType::kMessageTypeSeek => {
+                self.handle_command(SpircCommand::SetPosition(update.position()))
+            }
+
+            MessageType::kMessageTypeReplace => {
+                let context_uri = update.state.context_uri().to_owned();
+
+                // completely ignore local playback.
+                if context_uri.starts_with("spotify:local-files") {
+                    self.notify(None)?;
+                    return Err(SpircError::UnsupportedLocalPlayBack.into());
+                }
+
+                self.update_tracks(update.state.get_or_default());
+
+                if let SpircPlayStatus::Playing {
+                    preloading_of_next_track_triggered,
+                    ..
+                }
+                | SpircPlayStatus::Paused {
+                    preloading_of_next_track_triggered,
+                    ..
+                } = self.play_status
+                {
+                    if preloading_of_next_track_triggered {
+                        // Get the next track_id in the playlist
+                        if let Some(track_id) = self.preview_next_track() {
+                            if let Some(player) = &self.player {
+                                player.preload(track_id);
+                            }
+                        }
+                    }
+                }
+
+                self.notify(None)
+            }
+
+            MessageType::kMessageTypeVolume => {
+                self.handle_command(SpircCommand::SetVolume(update.volume() as u16))
+            }
+
+            MessageType::kMessageTypeNotify => {
+                if update.device_state.is_active() {
+                    if self.device.is_active()
+                        && self.device.became_active_at() <= update.device_state.became_active_at()
+                    {
+                        return self.handle_command(SpircCommand::Disconnect);
+                    }
+                    // if update comes from active device
+                    self.state = update.state.get_or_default().to_owned();
+                    self.device.set_volume(update.device_state.volume());
+                    self.active_device_ident = Some(update.ident().to_string());
+                    let active_device_name = update.device_state.name();
+                    info!("Device {active_device_name} is active!")
+                }
+                Ok(())
+            }
+
+            _ => Ok(()),
+        }
     }
 
-    fn update_state_position(&mut self, position_ms: u32) {
-        let now = self.now_ms();
-        self.state.set_position_measured_at(now as u64);
-        self.state.set_position_ms(position_ms);
+    fn handle_user_attributes_update(&mut self, update: UserAttributesUpdate) {
+        trace!("Received attributes update: {:#?}", update);
+        let attributes: UserAttributes = update
+            .pairs
+            .iter()
+            .map(|pair| (pair.key().to_owned(), pair.value().to_owned()))
+            .collect();
+        self.session.set_user_attributes(attributes)
+    }
+
+    fn handle_user_attributes_mutation(&mut self, mutation: UserAttributesMutation) {
+        for attribute in mutation.fields.iter() {
+            let key = &attribute.name;
+
+            if key == "autoplay" && self.session.config().autoplay.is_some() {
+                trace!("Autoplay override active. Ignoring mutation.");
+                continue;
+            }
+
+            if let Some(old_value) = self.session.user_data().attributes.get(key) {
+                let new_value = match old_value.as_ref() {
+                    "0" => "1",
+                    "1" => "0",
+                    _ => old_value,
+                };
+                self.session.set_user_attribute(key, new_value);
+
+                trace!(
+                    "Received attribute mutation, {} was {} is now {}",
+                    key,
+                    old_value,
+                    new_value
+                );
+
+                if key == "filter-explicit-content" && new_value == "1" {
+                    if let Some(player) = &self.player {
+                        player.emit_filter_explicit_content_changed_event(matches!(new_value, "1"));
+                    }
+                }
+
+                if key == "autoplay" && old_value != new_value {
+                    if let Some(player) = &self.player {
+                        player.emit_auto_play_changed_event(matches!(new_value, "1"));
+                    }
+                }
+            } else {
+                trace!(
+                    "Received attribute mutation for {} but key was not found!",
+                    key
+                );
+            }
+        }
+    }
+
+    fn handle_connection_id_update(&mut self, connection_id: String) {
+        trace!("Received connection ID update: {:?}", connection_id);
+        self.session.set_connection_id(&connection_id);
     }
 
     fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
         trace!("Received SpircCommand::{:?}", cmd);
         match (cmd, self.device.is_active()) {
-            (SpircCommand::Shutdown, _) => {
-                CommandSender::new(self, SpircCommand::Shutdown.try_into().unwrap()).send()?;
-                self.handle_command(SpircCommand::Disconnect).and({
-                    self.shutdown = true;
-                    if let Some(rx) = self.commands.as_mut() {
-                        rx.close()
-                    };
-                    Ok(())
-                })
-            }
-            (SpircCommand::Disconnect, true) => {
-                self.handle_disconnect();
+            (SpircCommand::PlayPause, _) => self.handle_play_pause(),
+            (SpircCommand::Shutdown, _) => self.handle_shutdown(),
+            (SpircCommand::Load(cmd), _) => {
+                self.handle_load(&cmd.into())?;
                 self.notify(None)
             }
-            (SpircCommand::Disconnect, false) => {
-                info!("Cannot disconnect if it is not connected!");
-                Ok(())
-            }
-            (SpircCommand::Activate, is_active) => {
-                if !is_active {
-                    trace!("Received SpircCommand::Activete");
-                    self.handle_activate();
-                    self.notify(None)
-                } else {
-                    warn!("Recived SpircCommand::Activete, while already active");
-                    Ok(())
-                }
-            }
-            (SpircCommand::PlayPause, _) => self.handle_play_pause(),
             (cmd, is_active) => {
                 match cmd {
-                    SpircCommand::Shuffle(shuffle) => self.state.set_shuffle(shuffle),
-                    SpircCommand::Repeat(repeat) => self.state.set_repeat(repeat),
-                    SpircCommand::SetPosition(position) => self.handle_seek(position),
                     SpircCommand::VolumeUp => self.handle_volume_up(),
                     SpircCommand::VolumeDown => self.handle_volume_down(),
-                    SpircCommand::SetVolume(volume) => self.set_volume(volume),
+                    SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle),
+                    SpircCommand::Repeat(repeat) => self.handle_repeat(repeat),
+                    SpircCommand::SetPosition(position) => self.handle_seek(position),
+                    SpircCommand::SetVolume(volume) => self.handle_set_volume(volume),
                     _ => (),
                 };
                 match (cmd, is_active) {
@@ -651,13 +845,18 @@ impl SpircTask {
                             SpircCommand::Pause => self.handle_pause(),
                             SpircCommand::Prev => self.handle_prev(),
                             SpircCommand::Next => self.handle_next(),
-                            SpircCommand::Load(command) => self.handle_load(&command.into())?,
+                            SpircCommand::Disconnect => self.handle_disconnect(),
+                            SpircCommand::Activate => warn!("Recived SpircCommand::Activete, while already active"),
                             _ => return Ok(()),
                         }
                         self.notify(None)
                     }
                     (cmd, false) => {
-                        if let Some(recepient) = self.active_device_ident.clone() {
+                        if let SpircCommand::Activate = cmd {
+                            trace!("Received SpircCommand::Activate");
+                            self.handle_activate();
+                            self.notify(None)
+                        } else if let Some(recepient) = self.active_device_ident.clone() {
                             info!("Will send command {cmd:?}");
                             match cmd.try_into() {
                                 Ok(cmd) => {
@@ -797,267 +996,37 @@ impl SpircTask {
         }
     }
 
-    fn handle_connection_id_update(&mut self, connection_id: String) {
-        trace!("Received connection ID update: {:?}", connection_id);
-        self.session.set_connection_id(&connection_id);
+    fn now_ms(&mut self) -> i64 {
+        let dur = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(dur) => dur,
+            Err(err) => err.duration(),
+        };
+
+        dur.as_millis() as i64 + 1000 * self.session.time_delta()
     }
 
-    fn handle_user_attributes_update(&mut self, update: UserAttributesUpdate) {
-        trace!("Received attributes update: {:#?}", update);
-        let attributes: UserAttributes = update
-            .pairs
-            .iter()
-            .map(|pair| (pair.key().to_owned(), pair.value().to_owned()))
-            .collect();
-        self.session.set_user_attributes(attributes)
+    fn update_state_position(&mut self, position_ms: u32) {
+        let now = self.now_ms();
+        self.state.set_position_measured_at(now as u64);
+        self.state.set_position_ms(position_ms);
     }
 
-    fn handle_user_attributes_mutation(&mut self, mutation: UserAttributesMutation) {
-        for attribute in mutation.fields.iter() {
-            let key = &attribute.name;
-
-            if key == "autoplay" && self.session.config().autoplay.is_some() {
-                trace!("Autoplay override active. Ignoring mutation.");
-                continue;
-            }
-
-            if let Some(old_value) = self.session.user_data().attributes.get(key) {
-                let new_value = match old_value.as_ref() {
-                    "0" => "1",
-                    "1" => "0",
-                    _ => old_value,
-                };
-                self.session.set_user_attribute(key, new_value);
-
-                trace!(
-                    "Received attribute mutation, {} was {} is now {}",
-                    key,
-                    old_value,
-                    new_value
-                );
-
-                if key == "filter-explicit-content" && new_value == "1" {
-                    if let Some(player) = &self.player {
-                        player.emit_filter_explicit_content_changed_event(matches!(new_value, "1"));
-                    }
-                }
-
-                if key == "autoplay" && old_value != new_value {
-                    if let Some(player) = &self.player {
-                        player.emit_auto_play_changed_event(matches!(new_value, "1"));
-                    }
-                }
-            } else {
-                trace!(
-                    "Received attribute mutation for {} but key was not found!",
-                    key
-                );
-            }
-        }
-    }
-
-    fn handle_remote_update(&mut self, update: Frame) -> Result<(), Error> {
-        trace!("Received update frame: {:#?}", update);
-
-        // First see if this update was intended for us.
-        let update_ident = update.ident();
-        if self.ident == update_ident
-            || (!update.recipient.is_empty() && !update.recipient.contains(&self.ident))
-        {
-            return Err(SpircError::Ident(update_ident.to_string()).into());
-        }
-
-        let old_client_id = self.session.client_id();
-
-        for entry in update.device_state.metadata.iter() {
-            match entry.type_() {
-                "client_id" => self.session.set_client_id(entry.metadata()),
-                "brand_display_name" => self.session.set_client_brand_name(entry.metadata()),
-                "model_display_name" => self.session.set_client_model_name(entry.metadata()),
-                _ => (),
-            }
-        }
-
-        self.session.set_client_name(update.device_state.name());
-
-        let new_client_id = self.session.client_id();
-
-        if self.device.is_active() && new_client_id != old_client_id {
-            if let Some(player) = &self.player {
-                player.emit_session_client_changed_event(
-                    new_client_id,
-                    self.session.client_name(),
-                    self.session.client_brand_name(),
-                    self.session.client_model_name(),
-                );
-            }
-        }
-
-        info!(
-            "Recieved Update type: {:?} from {:?}",
-            update.typ(),
-            update.device_state.name()
-        );
-        info!("{update:?}");
-        match update.typ() {
-            MessageType::kMessageTypeHello => self.notify(Some(update_ident)),
-
-            MessageType::kMessageTypeLoad => {
-                self.handle_load(update.state.get_or_default())?;
-                self.notify(None)
-            }
-
-            MessageType::kMessageTypePlay => self.handle_command(SpircCommand::Play),
-
-            MessageType::kMessageTypePlayPause => self.handle_command(SpircCommand::PlayPause),
-
-            MessageType::kMessageTypePause => self.handle_command(SpircCommand::Pause),
-
-            MessageType::kMessageTypeNext => self.handle_command(SpircCommand::Next),
-
-            MessageType::kMessageTypePrev => self.handle_command(SpircCommand::Prev),
-
-            MessageType::kMessageTypeVolumeUp => self.handle_command(SpircCommand::VolumeUp),
-
-            MessageType::kMessageTypeVolumeDown => self.handle_command(SpircCommand::VolumeDown),
-
-            MessageType::kMessageTypeRepeat => {
-                let repeat = update.state.repeat();
-
-                if let Some(player) = &self.player {
-                    player.emit_repeat_changed_event(repeat);
-                }
-
-                self.handle_command(SpircCommand::Repeat(repeat))
-            }
-
-            MessageType::kMessageTypeShuffle => {
-                let shuffle = update.state.shuffle();
-                if shuffle {
-                    let current_index = self.state.playing_track_index();
-                    let tracks = &mut self.state.track;
-                    if !tracks.is_empty() {
-                        tracks.swap(0, current_index as usize);
-                        if let Some((_, rest)) = tracks.split_first_mut() {
-                            let mut rng = rand::thread_rng();
-                            rest.shuffle(&mut rng);
-                        }
-                        self.state.set_playing_track_index(0);
-                    }
-                }
-                if let Some(player) = &self.player {
-                    player.emit_shuffle_changed_event(shuffle);
-                }
-                self.handle_command(SpircCommand::Shuffle(shuffle))
-            }
-
-            MessageType::kMessageTypeSeek => {
-                self.handle_command(SpircCommand::SetPosition(update.position()))
-            }
-
-            MessageType::kMessageTypeReplace => {
-                let context_uri = update.state.context_uri().to_owned();
-
-                // completely ignore local playback.
-                if context_uri.starts_with("spotify:local-files") {
-                    self.notify(None)?;
-                    return Err(SpircError::UnsupportedLocalPlayBack.into());
-                }
-
-                self.update_tracks(update.state.get_or_default());
-
-                if let SpircPlayStatus::Playing {
-                    preloading_of_next_track_triggered,
-                    ..
-                }
-                | SpircPlayStatus::Paused {
-                    preloading_of_next_track_triggered,
-                    ..
-                } = self.play_status
-                {
-                    if preloading_of_next_track_triggered {
-                        // Get the next track_id in the playlist
-                        if let Some(track_id) = self.preview_next_track() {
-                            if let Some(player) = &self.player {
-                                player.preload(track_id);
-                            }
-                        }
-                    }
-                }
-
-                self.notify(None)
-            }
-
-            MessageType::kMessageTypeVolume => {
-                self.handle_command(SpircCommand::SetVolume(update.volume() as u16))
-            }
-
-            MessageType::kMessageTypeNotify => {
-                if update.device_state.is_active() {
-                    if self.device.is_active()
-                        && self.device.became_active_at() <= update.device_state.became_active_at()
-                    {
-                        return self.handle_command(SpircCommand::Disconnect);
-                    }
-                    // if update comes from active device
-                    self.state = update.state.get_or_default().to_owned();
-                    self.device.set_volume(update.device_state.volume());
-                    self.active_device_ident = Some(update.ident().to_string());
-                    let active_device_name = update.device_state.name();
-                    info!("Device {active_device_name} is active!")
-                }
-                Ok(())
-            }
-
+    fn handle_play_pause(&mut self) -> Result<(), Error> {
+        match self.state.status() {
+            PlayStatus::kPlayStatusPause => self.handle_command(SpircCommand::Play),
+            PlayStatus::kPlayStatusPlay => self.handle_command(SpircCommand::Pause),
             _ => Ok(()),
         }
     }
 
-    fn handle_disconnect(&mut self) {
-        self.device.set_is_active(false);
-        self.handle_stop();
-
-        if let Some(player) = &self.player {
-            player.emit_session_disconnected_event(
-                self.session.connection_id(),
-                self.session.username(),
-            );
-        }
-    }
-
-    fn handle_stop(&mut self) {
-        if let Some(player) = &self.player {
-            player.stop();
-        }
-    }
-
-    fn handle_activate(&mut self) {
-        let now = self.now_ms();
-        self.device.set_is_active(true);
-        self.device.set_became_active_at(now);
-        if let Some(player) = &self.player {
-            player.emit_session_connected_event(
-                self.session.connection_id(),
-                self.session.username(),
-            );
-            player.emit_session_client_changed_event(
-                self.session.client_id(),
-                self.session.client_name(),
-                self.session.client_brand_name(),
-                self.session.client_model_name(),
-            );
-
-            player.emit_volume_changed_event(self.device.volume() as u16);
-
-            player.emit_auto_play_changed_event(self.session.autoplay());
-
-            player
-                .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
-
-            player.emit_shuffle_changed_event(self.state.shuffle());
-
-            player.emit_repeat_changed_event(self.state.repeat());
-        }
+    fn handle_shutdown(& mut self) -> Result<(), Error> {
+        CommandSender::new(self, SpircCommand::Shutdown.try_into().unwrap()).send()?;
+                self.handle_command(SpircCommand::Disconnect)?;
+                self.shutdown = true;
+                if let Some(rx) = self.commands.as_mut() {
+                    rx.close()
+                };
+                Ok(())
     }
 
     fn handle_load(&mut self, state: &State) -> Result<(), Error> {
@@ -1083,6 +1052,53 @@ impl SpircTask {
             self.handle_stop();
         }
         Ok(())
+    }
+
+    fn handle_volume_up(&mut self) {
+        let volume = (self.device.volume() as u16).saturating_add(VOLUME_STEP_SIZE);
+        self.set_volume(volume);
+    }
+
+    fn handle_volume_down(&mut self) {
+        let volume = (self.device.volume() as u16).saturating_sub(VOLUME_STEP_SIZE);
+        self.set_volume(volume);
+    }
+
+    fn handle_shuffle(&mut self, shuffle: bool) {
+        self.state.set_shuffle(shuffle);
+    }
+    
+    fn handle_repeat(&mut self, repeat: bool) {
+        self.state.set_repeat(repeat)
+    }
+
+    fn handle_seek(&mut self, position_ms: u32) {
+        self.update_state_position(position_ms);
+        if let Some(player) = &self.player {
+            player.seek(position_ms);
+        }
+        let now = self.now_ms();
+        match self.play_status {
+            SpircPlayStatus::Stopped => (),
+            SpircPlayStatus::LoadingPause {
+                position_ms: ref mut position,
+            }
+            | SpircPlayStatus::LoadingPlay {
+                position_ms: ref mut position,
+            }
+            | SpircPlayStatus::Paused {
+                position_ms: ref mut position,
+                ..
+            } => *position = position_ms,
+            SpircPlayStatus::Playing {
+                ref mut nominal_start_time,
+                ..
+            } => *nominal_start_time = now - position_ms as i64,
+        };
+    }
+
+    fn handle_set_volume(&mut self, volume: u16) {
+        self.set_volume(volume)
     }
 
     fn handle_play(&mut self) {
@@ -1118,14 +1134,6 @@ impl SpircTask {
         }
     }
 
-    fn handle_play_pause(&mut self) -> Result<(), Error> {
-        match self.state.status() {
-            PlayStatus::kPlayStatusPause => self.handle_command(SpircCommand::Play),
-            PlayStatus::kPlayStatusPlay => self.handle_command(SpircCommand::Pause),
-            _ => Ok(()),
-        }
-    }
-
     fn handle_pause(&mut self) {
         match self.play_status {
             SpircPlayStatus::Playing {
@@ -1153,88 +1161,44 @@ impl SpircTask {
         }
     }
 
-    fn handle_seek(&mut self, position_ms: u32) {
-        self.update_state_position(position_ms);
-        if let Some(player) = &self.player {
-            player.seek(position_ms);
-        }
-        let now = self.now_ms();
-        match self.play_status {
-            SpircPlayStatus::Stopped => (),
-            SpircPlayStatus::LoadingPause {
-                position_ms: ref mut position,
+    fn handle_prev(&mut self) {
+        // Previous behaves differently based on the position
+        // Under 3s it goes to the previous song (starts playing)
+        // Over 3s it seeks to zero (retains previous play status)
+        if self.position() < 3000 {
+            // Queued tracks always follow the currently playing track.
+            // They should not be considered when calculating the previous
+            // track so extract them beforehand and reinsert them after it.
+            let mut queue_tracks = Vec::new();
+            {
+                let queue_index = self.consume_queued_track();
+                let tracks = &mut self.state.track;
+                while queue_index < tracks.len() && tracks[queue_index].queued() {
+                    queue_tracks.push(tracks.remove(queue_index));
+                }
             }
-            | SpircPlayStatus::LoadingPlay {
-                position_ms: ref mut position,
+            let current_index = self.state.playing_track_index();
+            let new_index = if current_index > 0 {
+                current_index - 1
+            } else if self.state.repeat() {
+                self.state.track.len() as u32 - 1
+            } else {
+                0
+            };
+            // Reinsert queued tracks after the new playing track.
+            let mut pos = (new_index + 1) as usize;
+            for track in queue_tracks {
+                self.state.track.insert(pos, track);
+                pos += 1;
             }
-            | SpircPlayStatus::Paused {
-                position_ms: ref mut position,
-                ..
-            } => *position = position_ms,
-            SpircPlayStatus::Playing {
-                ref mut nominal_start_time,
-                ..
-            } => *nominal_start_time = now - position_ms as i64,
-        };
-    }
 
-    fn consume_queued_track(&mut self) -> usize {
-        // Removes current track if it is queued
-        // Returns the index of the next track
-        let current_index = self.state.playing_track_index() as usize;
-        if (current_index < self.state.track.len()) && self.state.track[current_index].queued() {
-            self.state.track.remove(current_index);
-            current_index
+            self.state.set_playing_track_index(new_index);
+
+            let start_playing = self.state.status() == PlayStatus::kPlayStatusPlay;
+            self.load_track(start_playing, 0);
         } else {
-            current_index + 1
+            self.handle_seek(0);
         }
-    }
-
-    fn preview_next_track(&mut self) -> Option<SpotifyId> {
-        self.get_track_id_to_play_from_playlist(self.state.playing_track_index() + 1)
-            .map(|(track_id, _)| track_id)
-    }
-
-    fn handle_preload_next_track(&mut self) {
-        // Requests the player thread to preload the next track
-        match self.play_status {
-            SpircPlayStatus::Paused {
-                ref mut preloading_of_next_track_triggered,
-                ..
-            }
-            | SpircPlayStatus::Playing {
-                ref mut preloading_of_next_track_triggered,
-                ..
-            } => {
-                *preloading_of_next_track_triggered = true;
-            }
-            _ => (),
-        }
-
-        if let Some(track_id) = self.preview_next_track() {
-            if let Some(player) = &self.player {
-                player.preload(track_id);
-            }
-        } else {
-            self.handle_stop();
-        }
-    }
-
-    // Mark unavailable tracks so we can skip them later
-    fn handle_unavailable(&mut self, track_id: SpotifyId) {
-        let unavailables = self.get_track_index_for_spotify_id(&track_id, 0);
-        for &index in unavailables.iter() {
-            let mut unplayable_track_ref = TrackRef::new();
-            unplayable_track_ref.set_gid(self.state.track[index].gid().to_vec());
-            // Misuse context field to flag the track
-            unplayable_track_ref.set_context(String::from("NonPlayable"));
-            std::mem::swap(&mut self.state.track[index], &mut unplayable_track_ref);
-            debug!(
-                "Marked <{:?}> at {:?} as NonPlayable",
-                self.state.track[index], index,
-            );
-        }
-        self.handle_preload_next_track();
     }
 
     fn handle_next(&mut self) {
@@ -1294,54 +1258,110 @@ impl SpircTask {
         }
     }
 
-    fn handle_prev(&mut self) {
-        // Previous behaves differently based on the position
-        // Under 3s it goes to the previous song (starts playing)
-        // Over 3s it seeks to zero (retains previous play status)
-        if self.position() < 3000 {
-            // Queued tracks always follow the currently playing track.
-            // They should not be considered when calculating the previous
-            // track so extract them beforehand and reinsert them after it.
-            let mut queue_tracks = Vec::new();
-            {
-                let queue_index = self.consume_queued_track();
-                let tracks = &mut self.state.track;
-                while queue_index < tracks.len() && tracks[queue_index].queued() {
-                    queue_tracks.push(tracks.remove(queue_index));
-                }
-            }
-            let current_index = self.state.playing_track_index();
-            let new_index = if current_index > 0 {
-                current_index - 1
-            } else if self.state.repeat() {
-                self.state.track.len() as u32 - 1
-            } else {
-                0
-            };
-            // Reinsert queued tracks after the new playing track.
-            let mut pos = (new_index + 1) as usize;
-            for track in queue_tracks {
-                self.state.track.insert(pos, track);
-                pos += 1;
-            }
+    fn handle_disconnect(&mut self) {
+        self.device.set_is_active(false);
+        self.handle_stop();
 
-            self.state.set_playing_track_index(new_index);
-
-            let start_playing = self.state.status() == PlayStatus::kPlayStatusPlay;
-            self.load_track(start_playing, 0);
-        } else {
-            self.handle_seek(0);
+        if let Some(player) = &self.player {
+            player.emit_session_disconnected_event(
+                self.session.connection_id(),
+                self.session.username(),
+            );
         }
     }
 
-    fn handle_volume_up(&mut self) {
-        let volume = (self.device.volume() as u16).saturating_add(VOLUME_STEP_SIZE);
-        self.set_volume(volume);
+    fn handle_activate(&mut self) {
+        let now = self.now_ms();
+        self.device.set_is_active(true);
+        self.device.set_became_active_at(now);
+        if let Some(player) = &self.player {
+            player.emit_session_connected_event(
+                self.session.connection_id(),
+                self.session.username(),
+            );
+            player.emit_session_client_changed_event(
+                self.session.client_id(),
+                self.session.client_name(),
+                self.session.client_brand_name(),
+                self.session.client_model_name(),
+            );
+
+            player.emit_volume_changed_event(self.device.volume() as u16);
+
+            player.emit_auto_play_changed_event(self.session.autoplay());
+
+            player
+                .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
+
+            player.emit_shuffle_changed_event(self.state.shuffle());
+
+            player.emit_repeat_changed_event(self.state.repeat());
+        }
     }
 
-    fn handle_volume_down(&mut self) {
-        let volume = (self.device.volume() as u16).saturating_sub(VOLUME_STEP_SIZE);
-        self.set_volume(volume);
+    fn handle_stop(&mut self) {
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+    }
+
+    fn consume_queued_track(&mut self) -> usize {
+        // Removes current track if it is queued
+        // Returns the index of the next track
+        let current_index = self.state.playing_track_index() as usize;
+        if (current_index < self.state.track.len()) && self.state.track[current_index].queued() {
+            self.state.track.remove(current_index);
+            current_index
+        } else {
+            current_index + 1
+        }
+    }
+
+    fn handle_preload_next_track(&mut self) {
+        // Requests the player thread to preload the next track
+        match self.play_status {
+            SpircPlayStatus::Paused {
+                ref mut preloading_of_next_track_triggered,
+                ..
+            }
+            | SpircPlayStatus::Playing {
+                ref mut preloading_of_next_track_triggered,
+                ..
+            } => {
+                *preloading_of_next_track_triggered = true;
+            }
+            _ => (),
+        }
+
+        if let Some(track_id) = self.preview_next_track() {
+            if let Some(player) = &self.player {
+                player.preload(track_id);
+            }
+        } else {
+            self.handle_stop();
+        }
+    }
+
+    fn preview_next_track(&mut self) -> Option<SpotifyId> {
+        self.get_track_id_to_play_from_playlist(self.state.playing_track_index() + 1)
+            .map(|(track_id, _)| track_id)
+    }
+
+    // Mark unavailable tracks so we can skip them later
+    fn handle_unavailable(&mut self, track_id: SpotifyId) {
+        let unavailables = self.get_track_index_for_spotify_id(&track_id, 0);
+        for &index in unavailables.iter() {
+            let mut unplayable_track_ref = TrackRef::new();
+            unplayable_track_ref.set_gid(self.state.track[index].gid().to_vec());
+            // Misuse context field to flag the track
+            unplayable_track_ref.set_context(String::from("NonPlayable"));
+            std::mem::swap(&mut self.state.track[index], &mut unplayable_track_ref);
+            debug!(
+                "Marked <{:?}> at {:?} as NonPlayable",
+                self.state.track[index], index,
+            );
+        }
+        self.handle_preload_next_track();
     }
 
     fn handle_end_of_track(&mut self) -> Result<(), Error> {
@@ -1435,9 +1455,30 @@ impl SpircTask {
         index
     }
 
-    // Broken out here so we can refactor this later when we move to SpotifyObjectID or similar
-    fn track_ref_is_unavailable(&self, track_ref: &TrackRef) -> bool {
-        track_ref.context() == "NonPlayable"
+    fn load_track(&mut self, start_playing: bool, position_ms: u32) {
+        let index = self.state.playing_track_index();
+
+        match self.get_track_id_to_play_from_playlist(index) {
+            Some((track, index)) => {
+                self.state.set_playing_track_index(index);
+
+                if let Some(player) = &mut self.player {
+                    self.play_request_id = Some(player.load(track, start_playing, position_ms));
+                }
+
+                self.update_state_position(position_ms);
+                if start_playing {
+                    self.state.set_status(PlayStatus::kPlayStatusPlay);
+                    self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
+                } else {
+                    self.state.set_status(PlayStatus::kPlayStatusPause);
+                    self.play_status = SpircPlayStatus::LoadingPause { position_ms };
+                }
+            }
+            None => {
+                self.handle_stop();
+            }
+        }
     }
 
     fn get_track_id_to_play_from_playlist(&self, index: u32) -> Option<(SpotifyId, u32)> {
@@ -1490,30 +1531,9 @@ impl SpircTask {
         }
     }
 
-    fn load_track(&mut self, start_playing: bool, position_ms: u32) {
-        let index = self.state.playing_track_index();
-
-        match self.get_track_id_to_play_from_playlist(index) {
-            Some((track, index)) => {
-                self.state.set_playing_track_index(index);
-
-                if let Some(player) = &mut self.player {
-                    self.play_request_id = Some(player.load(track, start_playing, position_ms));
-                }
-
-                self.update_state_position(position_ms);
-                if start_playing {
-                    self.state.set_status(PlayStatus::kPlayStatusPlay);
-                    self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
-                } else {
-                    self.state.set_status(PlayStatus::kPlayStatusPause);
-                    self.play_status = SpircPlayStatus::LoadingPause { position_ms };
-                }
-            }
-            None => {
-                self.handle_stop();
-            }
-        }
+    // Broken out here so we can refactor this later when we move to SpotifyObjectID or similar
+    fn track_ref_is_unavailable(&self, track_ref: &TrackRef) -> bool {
+        track_ref.context() == "NonPlayable"
     }
 
     fn hello(&mut self) -> Result<(), Error> {
