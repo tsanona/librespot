@@ -1746,14 +1746,14 @@ async fn main() {
                 };
 
                 let (spirc_, spirc_task_) = match Spirc::new(connect_config, session.clone(), last_credentials.clone().unwrap_or_default(), Some(player), Some(mixer)).await {
-                    Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
+                    Ok((spirc_, spirc_task_, events_)) => (spirc_, spirc_task_),
                     Err(e) => {
                         error!("could not initialize spirc: {}", e);
                         exit(1);
                     }
                 };
                 spirc = Some(spirc_);
-                spirc_task = Some(Box::pin(spirc_task_));
+                spirc_task = Some(Box::pin(spirc_task_.run()));
 
                 connecting = false;
             },
