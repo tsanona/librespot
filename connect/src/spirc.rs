@@ -10,7 +10,7 @@ use futures_util::{stream::FusedStream, FutureExt, StreamExt};
 use protobuf::{self, Message};
 use rand::prelude::SliceRandom;
 use thiserror::Error;
-use tokio::sync::{mpsc, mpsc::error::SendError, broadcast};
+use tokio::sync::{broadcast, mpsc, mpsc::error::SendError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
@@ -274,7 +274,7 @@ impl From<SpircLoadCommand> for State {
 }
 
 pub struct Spirc {
-    commands: mpsc::UnboundedSender<SpircCommand>
+    commands: mpsc::UnboundedSender<SpircCommand>,
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -494,7 +494,7 @@ pub struct SpircTask {
 
     spirc_id: usize,
 
-    event_bradcaster: broadcast::Sender<Frame>
+    event_bradcaster: broadcast::Sender<Frame>,
 }
 
 impl SpircTask {
@@ -669,7 +669,7 @@ impl SpircTask {
             MessageType::kMessageTypeHello => self.notify(Some(update_ident)),
 
             MessageType::kMessageTypeLoad => self.handle_command(SpircCommand::Load(
-                SpircLoadCommand::from_state(update.state.get_or_default().to_owned())
+                SpircLoadCommand::from_state(update.state.get_or_default().to_owned()),
             )),
 
             MessageType::kMessageTypePlay => self.handle_command(SpircCommand::Play),
