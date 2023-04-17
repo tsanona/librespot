@@ -49,7 +49,7 @@ async fn main() {
         move || backend(None, audio_format),
     );
 
-    let (spirc, spirc_task) = Spirc::new(
+    let (spirc, spirc_task, events_) = Spirc::new(
         connect_config,
         session.clone(),
         credentials,
@@ -59,7 +59,7 @@ async fn main() {
     .await
     .unwrap();
 
-    join!(spirc_task, async {
+    join!(spirc_task.run(), async {
         let album = Album::get(&session, &SpotifyId::from_uri(&context_uri).unwrap())
             .await
             .unwrap();

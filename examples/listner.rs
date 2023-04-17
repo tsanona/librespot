@@ -6,10 +6,10 @@ use librespot::{
         session::Session,
     },
 };
-use std::{io, process::exit};
-//use dotenv;
+use std::env;
+use std::{process::exit};
 use env_logger;
-use log::{error, info, warn, LevelFilter};
+use log::{error, info, LevelFilter};
 
 #[tokio::main]
 async fn main() {
@@ -26,8 +26,17 @@ async fn main() {
         can_play: false,
     };
 
-    println!("Connecting...");
-    let credentials = Credentials::with_password("username", "password");
+    let mut args: Vec<_> = env::args().collect();
+    let context_uri = if args.len() == 4 {
+        args.pop().unwrap()
+    } else if args.len() == 3 {
+        String::from("spotify:album:79dL7FLiJFOO0EoehUHQBv")
+    } else {
+        eprintln!("Usage: {} USERNAME PASSWORD (ALBUM URI)", args[0]);
+        return;
+    };
+
+    let credentials = Credentials::with_password(&args[1], &args[2]);
     let session = Session::new(session_config, None);
 
     //session.connect(credentials.clone(), false).await.unwrap();

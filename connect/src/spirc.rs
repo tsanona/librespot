@@ -686,15 +686,7 @@ impl SpircTask {
 
             MessageType::kMessageTypeVolumeDown => self.handle_command(SpircCommand::VolumeDown),
 
-            MessageType::kMessageTypeRepeat => {
-                let repeat = update.state.repeat();
-
-                if let Some(player) = &self.player {
-                    player.emit_repeat_changed_event(repeat);
-                }
-
-                self.handle_command(SpircCommand::Repeat(repeat))
-            }
+            MessageType::kMessageTypeRepeat => self.handle_command(SpircCommand::Repeat(update.state.repeat())),
 
             MessageType::kMessageTypeShuffle => {
                 let shuffle = update.state.shuffle();
@@ -875,44 +867,6 @@ impl SpircTask {
             info!("No Active device to send {cmd:?}");
             Ok(())
         }
-        /* match (cmd, self.device.is_active()) {
-            (cmd, true) => {
-                trace!("Received SpircCommand::{:?}", cmd);
-                match cmd {
-                    SpircCommand::Play => self.handle_play(),
-                    SpircCommand::Pause => self.handle_pause(),
-                    SpircCommand::Prev => self.handle_prev(),
-                    SpircCommand::Next => self.handle_next(),
-                    SpircCommand::Disconnect => self.handle_disconnect(),
-                    SpircCommand::Activate => warn!("Recived SpircCommand::Activete, while already active"),
-                    _ => return Ok(()),
-                }
-                self.notify(None)
-            }
-            (cmd, false) => {
-                if let SpircCommand::Activate = cmd {
-                    trace!("Received SpircCommand::Activate");
-                    self.handle_activate();
-                    self.notify(None)
-                } else if let Some(recepient) = self.active_device_ident.clone() {
-                    info!("Will send command {cmd:?}");
-                    match cmd.try_into() {
-                        Ok(cmd) => {
-                            let mut cs = CommandSender::new(self, cmd);
-                            cs = cs.recipient(&recepient);
-                            cs.send()
-                        }
-                        Err(cmd) => {
-                            info!("Command {cmd:?} is not implemented");
-                            Ok(())
-                        }
-                    }
-                } else {
-                    info!("No Active device to send {cmd:?}");
-                    Ok(())
-                }
-            }
-        } */
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
@@ -1235,6 +1189,9 @@ impl SpircTask {
     }
 
     fn handle_repeat(&mut self, repeat: bool) {
+        if let Some(player) = &self.player {
+            player.emit_repeat_changed_event(repeat);
+        }
         self.state.set_repeat(repeat)
     }
 
