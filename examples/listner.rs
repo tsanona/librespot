@@ -1,3 +1,4 @@
+use env_logger;
 use librespot::{
     connect::{config::ConnectConfig, spirc::Spirc},
     core::{
@@ -6,10 +7,9 @@ use librespot::{
         session::Session,
     },
 };
-use std::env;
-use std::{process::exit};
-use env_logger;
 use log::{error, info, LevelFilter};
+use std::env;
+use std::process::exit;
 
 #[tokio::main]
 async fn main() {

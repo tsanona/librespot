@@ -1661,7 +1661,6 @@ async fn main() {
     let mut auto_connect_times: Vec<Instant> = vec![];
     let mut discovery = None;
     let mut connecting = false;
-    let mut _event_handler: Option<EventHandler> = None;
 
     let session = Session::new(setup.session_config.clone(), setup.cache.clone());
 
@@ -1736,7 +1735,6 @@ async fn main() {
                 });
 
                 if let Some(player_event_program) = setup.player_event_program.clone() {
-                    _event_handler = Some(EventHandler::new(player.get_player_event_channel(), &player_event_program));
 
                     if setup.emit_sink_events {
                         player.set_sink_event_callback(Some(Box::new(move |sink_status| {

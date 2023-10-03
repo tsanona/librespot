@@ -54,7 +54,8 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 pub type PlayerResult = Result<(), Error>;
 
 pub struct Player {
-    commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
+    command_sender: mpsc::UnboundedSender<PlayerCommand>,
+    pub event_receiver: mpsc::UnboundedReceiver<PlayerEvent>,
     thread_handle: Option<thread::JoinHandle<()>>,
     play_request_id_generator: SeqGenerator<u64>,
 }
@@ -71,7 +72,7 @@ pub type SinkEventCallback = Box<dyn Fn(SinkStatus) + Send>;
 struct PlayerInternal {
     session: Session,
     config: PlayerConfig,
-    commands: mpsc::UnboundedReceiver<PlayerCommand>,
+    command_receiver: mpsc::UnboundedReceiver<PlayerCommand>,
     load_handles: Arc<Mutex<HashMap<thread::ThreadId, thread::JoinHandle<()>>>>,
 
     state: PlayerState,
@@ -80,7 +81,7 @@ struct PlayerInternal {
     sink_status: SinkStatus,
     sink_event_callback: Option<SinkEventCallback>,
     volume_getter: Box<dyn VolumeGetter + Send>,
-    event_senders: Vec<mpsc::UnboundedSender<PlayerEvent>>,
+    event_sender: mpsc::UnboundedSender<PlayerEvent>,
     converter: Converter,
 
     normalisation_integrator: f64,
@@ -107,7 +108,6 @@ enum PlayerCommand {
     Pause,
     Stop,
     Seek(u32),
-    AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
     SetSinkEventCallback(Option<SinkEventCallback>),
     EmitVolumeChangedEvent(u16),
     SetAutoNormaliseAsAlbum(bool),
@@ -415,7 +415,7 @@ impl Player {
     where
         F: FnOnce() -> Box<dyn Sink> + Send + 'static,
     {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -443,7 +443,9 @@ impl Player {
             }
         }
 
-        let handle = thread::spawn(move || {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+
+        let thread_handle = thread::spawn(move || {
             let player_id = PLAYER_COUNTER.fetch_add(1, Ordering::AcqRel);
             debug!("new Player [{}]", player_id);
 
@@ -452,7 +454,7 @@ impl Player {
             let internal = PlayerInternal {
                 session,
                 config,
-                commands: cmd_rx,
+                command_receiver,
                 load_handles: Arc::new(Mutex::new(HashMap::new())),
 
                 state: PlayerState::Stopped,
@@ -461,7 +463,7 @@ impl Player {
                 sink_status: SinkStatus::Closed,
                 sink_event_callback: None,
                 volume_getter,
-                event_senders: vec![],
+                event_sender,
                 converter,
 
                 normalisation_peak: 0.0,
@@ -481,17 +483,16 @@ impl Player {
         });
 
         Self {
-            commands: Some(cmd_tx),
-            thread_handle: Some(handle),
+            command_sender,
+            thread_handle: Some(thread_handle),
+            event_receiver,
             play_request_id_generator: SeqGenerator::new(0),
         }
     }
 
     fn command(&self, cmd: PlayerCommand) {
-        if let Some(commands) = self.commands.as_ref() {
-            if let Err(e) = commands.send(cmd) {
-                error!("Player Commands Error: {}", e);
-            }
+        if let Err(e) = self.command_sender.send(cmd) {
+            error!("Player Commands Error: {}", e);
         }
     }
 
@@ -527,15 +528,8 @@ impl Player {
         self.command(PlayerCommand::Seek(position_ms));
     }
 
-    pub fn get_player_event_channel(&self) -> PlayerEventChannel {
-        let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        self.command(PlayerCommand::AddEventSender(event_sender));
-        event_receiver
-    }
-
-    pub async fn await_end_of_track(&self) {
-        let mut channel = self.get_player_event_channel();
-        while let Some(event) = channel.recv().await {
+    pub async fn await_end_of_track(&mut self) {
+        while let Some(event) = self.event_receiver.recv().await {
             if matches!(
                 event,
                 PlayerEvent::EndOfTrack { .. } | PlayerEvent::Stopped { .. }
@@ -606,7 +600,6 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         debug!("Shutting down player thread ...");
-        self.commands = None;
         if let Some(handle) = self.thread_handle.take() {
             if let Err(e) = handle.join() {
                 error!("Player thread Error: {:?}", e);
@@ -1148,7 +1141,7 @@ impl Future for PlayerInternal {
             let mut all_futures_completed_or_not_ready = true;
 
             // process commands that were sent to us
-            let cmd = match self.commands.poll_recv(cx) {
+            let cmd = match self.command_receiver.poll_recv(cx) {
                 Poll::Ready(None) => return Poll::Ready(()), // client has disconnected - shut down.
                 Poll::Ready(Some(cmd)) => {
                     all_futures_completed_or_not_ready = false;
@@ -2075,8 +2068,6 @@ impl PlayerInternal {
 
             PlayerCommand::Stop => self.handle_player_stop(),
 
-            PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
-
             PlayerCommand::SetSinkEventCallback(callback) => self.sink_event_callback = callback,
 
             PlayerCommand::EmitVolumeChangedEvent(volume) => {
@@ -2160,8 +2151,7 @@ impl PlayerInternal {
     }
 
     fn send_event(&mut self, event: PlayerEvent) {
-        self.event_senders
-            .retain(|sender| sender.send(event.clone()).is_ok());
+        self.event_sender.send(event.clone());
     }
 
     fn load_track(
@@ -2265,7 +2255,6 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
             PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
-            PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
             PlayerCommand::SetSinkEventCallback(_) => {
                 f.debug_tuple("SetSinkEventCallback").finish()
             }

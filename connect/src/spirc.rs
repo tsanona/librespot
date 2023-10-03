@@ -22,7 +22,7 @@ use crate::{
     },
     playback::{
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        player::{Player, PlayerEvent},
     },
     protocol::{
         self,
@@ -366,8 +366,6 @@ impl Spirc {
 
         let device = init_device_state(config);
 
-        let player_events = player.as_ref().map(|p| p.get_player_event_channel());
-
         let mut task = SpircTask {
             player,
             mixer,
@@ -388,7 +386,6 @@ impl Spirc {
             user_attributes_mutation,
             sender,
             commands: Some(cmd_rx),
-            player_events: player_events,
 
             shutdown: false,
             session,
@@ -484,7 +481,6 @@ pub struct SpircTask {
     user_attributes_mutation: BoxedStream<Result<UserAttributesMutation, Error>>,
     sender: MercurySender,
     commands: Option<mpsc::UnboundedReceiver<SpircCommand>>,
-    player_events: Option<PlayerEventChannel>,
 
     shutdown: bool,
     session: Session,
@@ -505,7 +501,6 @@ impl SpircTask {
     pub async fn run(mut self) {
         while !self.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
-            let player_events = self.player_events.as_mut();
             tokio::select! {
                 remote_update = self.remote_update.next() => match remote_update {
                     Some(result) => match result {
@@ -558,7 +553,7 @@ impl SpircTask {
                         debug!("could not dispatch command: {}", e);
                     }
                 },
-                event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
+                event = async { self.player.as_mut()?.event_receiver.recv().await }, if self.player.is_some() => if let Some(event) = event {
                     if let Err(e) = self.handle_player_event(event) {
                         error!("could not dispatch player event: {}", e);
                     }
@@ -686,7 +681,9 @@ impl SpircTask {
 
             MessageType::kMessageTypeVolumeDown => self.handle_command(SpircCommand::VolumeDown),
 
-            MessageType::kMessageTypeRepeat => self.handle_command(SpircCommand::Repeat(update.state.repeat())),
+            MessageType::kMessageTypeRepeat => {
+                self.handle_command(SpircCommand::Repeat(update.state.repeat()))
+            }
 
             MessageType::kMessageTypeShuffle => {
                 let shuffle = update.state.shuffle();
