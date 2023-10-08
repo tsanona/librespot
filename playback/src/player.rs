@@ -53,9 +53,13 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
 pub type PlayerResult = Result<(), Error>;
 
+pub type PlayerEventChannel = mpsc::UnboundedReceiver<PlayerEvent>;
+
+pub type PlayerCommanChannel = mpsc::UnboundedSender<PlayerCommand>;
+
 pub struct Player {
-    command_sender: mpsc::UnboundedSender<PlayerCommand>,
-    pub event_receiver: mpsc::UnboundedReceiver<PlayerEvent>,
+    command_sender: PlayerCommanChannel,
+    pub event_receiver: PlayerEventChannel,
     thread_handle: Option<thread::JoinHandle<()>>,
     play_request_id_generator: SeqGenerator<u64>,
 }
@@ -263,8 +267,6 @@ impl PlayerEvent {
         }
     }
 }
-
-pub type PlayerEventChannel = mpsc::UnboundedReceiver<PlayerEvent>;
 
 pub fn db_to_ratio(db: f64) -> f64 {
     f64::powf(10.0, db / DB_VOLTAGE_RATIO)
