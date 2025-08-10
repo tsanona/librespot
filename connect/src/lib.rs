@@ -12,8 +12,10 @@ mod context_resolver;
 mod model;
 mod shuffle_vec;
 mod spirc;
+mod observer;
 mod state;
 
 pub use model::*;
 pub use spirc::*;
+pub use observer::*;
 pub use state::*;
