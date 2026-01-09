@@ -1,10 +1,12 @@
 use futures_util::StreamExt;
-use librespot::{
-    connect::Spirc,
-};
+use librespot::connect::Spirc;
 use log::{error, info, warn};
 use std::{
-    env, ffi::OsStr, process::exit, sync::Arc, time::{Duration, Instant}
+    env,
+    ffi::OsStr,
+    process::exit,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 

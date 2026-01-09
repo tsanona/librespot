@@ -25,7 +25,15 @@ use librespot_playback::{mixer::Mixer, player::Player};
 use log::{debug, error, info, trace, warn};
 use sha1::{Digest, Sha1};
 use std::{
-    env, fs::create_dir_all, ops::RangeInclusive, path::{Path, PathBuf}, pin::Pin, process::exit, str::FromStr, sync::Arc, time::Duration
+    env,
+    fs::create_dir_all,
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::exit,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 use sysinfo::{ProcessesToUpdate, System};
 use thiserror::Error;
@@ -260,8 +268,10 @@ impl Setup {
                         }
                     }
                 }
-            };
-        } else {None}
+            }
+        } else {
+            None
+        }
     }
 
     pub fn get_credentials(&self, connecting: &mut bool) -> Option<Arc<Credentials>> {
@@ -289,8 +299,12 @@ impl Setup {
                 exit(1);
             });
             *connecting = true;
-            Some(Arc::new(Credentials::with_access_token(oauth_token.access_token)))
-        } else { None }
+            Some(Arc::new(Credentials::with_access_token(
+                oauth_token.access_token,
+            )))
+        } else {
+            None
+        }
     }
 
     pub fn get_mixer(&self) -> Arc<dyn Mixer> {
@@ -326,12 +340,24 @@ impl Setup {
                 })));
             }
             handler
-        } else { None }
+        } else {
+            None
+        }
     }
 
-    pub async fn get_spirc(&self, session: Session, credentials: Credentials, player: Arc<Player>, mixer: Arc<dyn Mixer>) -> (Option<Spirc>, Option<Pin<Box<impl Future<Output = ()> + 'static>>>) {
+    pub async fn get_spirc(
+        &self,
+        session: Session,
+        credentials: Credentials,
+        player: Arc<Player>,
+        mixer: Arc<dyn Mixer>,
+    ) -> (
+        Option<Spirc>,
+        Option<Pin<Box<impl Future<Output = ()> + 'static>>>,
+    ) {
         let connect_config = self.connect_config.clone();
-        let (spirc_, spirc_task_) = match Spirc::new(connect_config, session, credentials, player, mixer).await {
+        let (spirc_, spirc_task_) =
+            match Spirc::new(connect_config, session, credentials, player, mixer).await {
                 Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
                 Err(e) => {
                     error!("could not initialize spirc: {e}");
