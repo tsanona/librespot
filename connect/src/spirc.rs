@@ -1,13 +1,15 @@
 use crate::{
+    LoadContextOptions, LoadRequestOptions, PlayContext,
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
     core::{
+        Error, Session, SpotifyUri,
         authentication::Credentials,
         dealer::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
             protocol::{Command, FallbackWrapper, Message, Request},
         },
         session::UserAttributes,
-        Error, Session, SpotifyId,
+        spclient::TransferRequest,
     },
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
@@ -28,15 +30,14 @@ use crate::{
         provider::IsProvider,
         {ConnectConfig, ConnectState},
     },
-    LoadContextOptions, LoadRequestOptions, PlayContext,
 };
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
 use protobuf::MessageField;
 use std::{
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -73,6 +74,7 @@ struct SpircTask {
 
     /// the state management object
     connect_state: ConnectState,
+    connect_established: bool,
 
     play_request_id: Option<u64>,
     play_status: SpircPlayStatus,
@@ -128,6 +130,7 @@ enum SpircCommand {
     SetPosition(u32),
     SetVolume(u16),
     Activate,
+    Transfer(Option<TransferRequest>),
     Load(LoadRequest),
 }
 
@@ -166,7 +169,7 @@ impl Spirc {
         }
 
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
-        debug!("new Spirc[{}]", spirc_id);
+        debug!("new Spirc[{spirc_id}]");
 
         let connect_state = ConnectState::new(config, &session);
 
@@ -225,6 +228,7 @@ impl Spirc {
             mixer,
 
             connect_state,
+            connect_established: false,
 
             play_request_id: None,
             play_status: SpircPlayStatus::Stopped,
@@ -393,9 +397,18 @@ impl Spirc {
 
     /// Acquires the control as active connect device.
     ///
-    /// Does nothing if we are not the active device.
+    /// Does not [Spirc::transfer] the playback. Does nothing if we are not the active device.
     pub fn activate(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Activate)?)
+    }
+
+    /// Acquires the control as active connect device over the transfer flow.
+    ///
+    /// Does nothing if we are not the active device.
+    pub fn transfer(&self, transfer_request: Option<TransferRequest>) -> Result<(), Error> {
+        Ok(self
+            .commands
+            .send(SpircCommand::Transfer(transfer_request))?)
     }
 }
 
@@ -446,14 +459,14 @@ impl SpircTask {
                 cluster_update = self.connect_state_update.next() => unwrap! {
                     cluster_update,
                     match |cluster_update| if let Err(e) = self.handle_cluster_update(cluster_update).await {
-                        error!("could not dispatch connect state update: {}", e);
+                        error!("could not dispatch connect state update: {e}");
                     }
                 },
                 // main dealer request handling (dealer expects an answer)
                 request = self.connect_state_command.next() => unwrap! {
                     request,
                     |request| if let Err(e) = self.handle_connect_state_request(request).await {
-                        error!("couldn't handle connect state command: {}", e);
+                        error!("couldn't handle connect state command: {e}");
                     }
                 },
                 // volume request handling is send separately (it's more like a fire forget)
@@ -489,14 +502,14 @@ impl SpircTask {
                     session_update,
                     match |session_update| self.handle_session_update(session_update)
                 },
-                cmd = async { commands?.recv().await }, if commands.is_some() => if let Some(cmd) = cmd {
+                cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => if let Some(cmd) = cmd {
                     if let Err(e) = self.handle_command(cmd).await {
-                        debug!("could not dispatch command: {}", e);
+                        debug!("could not dispatch command: {e}");
                     }
                 },
                 event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
                     if let Err(e) = self.handle_player_event(event) {
-                        error!("could not dispatch player event: {}", e);
+                        error!("could not dispatch player event: {e}");
                     }
                 },
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
@@ -531,7 +544,13 @@ impl SpircTask {
                 // finish after we received our last item of a type
                 next_context = async {
                     self.context_resolver.get_next_context(|| {
+                        // Sending local file URIs to this endpoint results in a Bad Request status.
+                        // It's likely appropriate to filter them out anyway; Spotify's backend
+                        // has no knowledge about these tracks and so can't do anything with them.
                         self.connect_state.recent_track_uris()
+                            .into_iter()
+                            .filter(|t| !t.starts_with("spotify:local"))
+                            .collect::<Vec<_>>()
                     }).await
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
                     let update_state = self.handle_next_context(next_context);
@@ -551,6 +570,11 @@ impl SpircTask {
                 error!("error during disconnecting: {why}")
             }
         }
+
+        // this should clear the active session id, leaving an empty state
+        if let Err(why) = self.session.spclient().delete_connect_state_request().await {
+            error!("error during connect state deletion: {why}")
+        };
 
         self.session.dealer().close().await;
     }
@@ -606,7 +630,7 @@ impl SpircTask {
     }
 
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
-        trace!("Received SpircCommand::{:?}", cmd);
+        trace!("Received SpircCommand::{cmd:?}");
         match cmd {
             SpircCommand::Shutdown => {
                 trace!("Received SpircCommand::Shutdown");
@@ -617,17 +641,24 @@ impl SpircTask {
                     rx.close()
                 }
             }
+            SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
+                let device_id = self.session.device_id();
+                self.session
+                    .spclient()
+                    .transfer(device_id, device_id, request.as_ref())
+                    .await?;
+                return Ok(());
+            }
             SpircCommand::Activate if !self.connect_state.is_active() => {
-                trace!("Received SpircCommand::{:?}", cmd);
+                trace!("Received SpircCommand::{cmd:?}");
                 self.handle_activate();
                 return self.notify().await;
             }
-            SpircCommand::Activate => warn!(
-                "SpircCommand::{:?} will be ignored while already active",
-                cmd
-            ),
+            SpircCommand::Transfer(..) | SpircCommand::Activate => {
+                warn!("SpircCommand::{cmd:?} will be ignored while already active")
+            }
             _ if !self.connect_state.is_active() => {
-                warn!("SpircCommand::{:?} will be ignored while Not Active", cmd)
+                warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
             }
             SpircCommand::Disconnect { pause } => {
                 if pause {
@@ -647,7 +678,7 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None).await?,
+            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
         };
 
         self.notify().await
@@ -774,8 +805,8 @@ impl SpircTask {
                 return Ok(());
             }
             PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
+                self.handle_unavailable(&track_id)?;
+                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
                     self.handle_next(None)?
                 }
             }
@@ -787,7 +818,7 @@ impl SpircTask {
     }
 
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
-        trace!("Received connection ID update: {:?}", connection_id);
+        trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
         let cluster = match self
@@ -807,6 +838,8 @@ impl SpircTask {
             "successfully put connect state for {} with connection-id {connection_id}",
             self.session.device_id()
         );
+
+        self.connect_established = true;
 
         let same_session = cluster.player_state.session_id == self.session.session_id()
             || cluster.player_state.session_id.is_empty();
@@ -837,7 +870,7 @@ impl SpircTask {
     }
 
     fn handle_user_attributes_update(&mut self, update: UserAttributesUpdate) {
-        trace!("Received attributes update: {:#?}", update);
+        trace!("Received attributes update: {update:#?}");
         let attributes: UserAttributes = update
             .pairs
             .iter()
@@ -863,12 +896,7 @@ impl SpircTask {
                 };
                 self.session.set_user_attribute(key, new_value);
 
-                trace!(
-                    "Received attribute mutation, {} was {} is now {}",
-                    key,
-                    old_value,
-                    new_value
-                );
+                trace!("Received attribute mutation, {key} was {old_value} is now {new_value}");
 
                 if key == "filter-explicit-content" && new_value == "1" {
                     self.player
@@ -882,10 +910,7 @@ impl SpircTask {
                     self.add_autoplay_resolving_when_required()
                 }
             } else {
-                trace!(
-                    "Received attribute mutation for {} but key was not found!",
-                    key
-                );
+                trace!("Received attribute mutation for {key} but key was not found!");
             }
         }
     }
@@ -907,8 +932,8 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
-                self.connect_state.became_inactive(&self.session).await?;
-                self.handle_stop()
+                self.handle_disconnect().await?;
+                self.handle_stop();
             } else if self.connect_state.is_active() {
                 // fixme: workaround fix, because of missing information why it behaves like it does
                 //  background: when another device sends a connect-state update, some player's position de-syncs
@@ -960,7 +985,8 @@ impl SpircTask {
                 {
                     debug!(
                         "ignoring context update for <{:?}>, because it isn't the current context <{}>",
-                        update_context.context.uri, self.connect_state.context_uri()
+                        update_context.context.uri,
+                        self.connect_state.context_uri()
                     )
                 } else {
                     self.context_resolver.add(ResolveContext::from_context(
@@ -1001,6 +1027,13 @@ impl SpircTask {
                     .map(Into::into)
                     .map(LoadContextOptions::Options);
 
+                let fallback_index = play
+                    .options
+                    .skip_to
+                    .as_ref()
+                    .and_then(|s| s.track_index)
+                    .map(|i| i as usize);
+
                 self.handle_load(
                     LoadRequest {
                         context,
@@ -1012,6 +1045,7 @@ impl SpircTask {
                         },
                     },
                     play.context.pages.pop(),
+                    fallback_index,
                 )
                 .await?;
 
@@ -1059,13 +1093,17 @@ impl SpircTask {
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
-            // can apparently happen when a state is transferred stared with "uris" via the api
-            Some(ref uri) if uri == "-" => String::new(),
-            Some(ref uri) => uri.clone(),
+            // can apparently happen when a state is transferred and was started with "uris" via the api
+            Some(ref uri) if uri == "-" || uri.is_empty() => None,
+            Some(ref uri) => Some(uri.clone()),
         };
 
-        self.connect_state
-            .reset_context(ResetContext::WhenDifferent(&ctx_uri));
+        self.connect_state.reset_context(
+            ctx_uri
+                .as_deref()
+                .map(ResetContext::WhenDifferent)
+                .unwrap_or(ResetContext::Completely),
+        );
 
         match self.connect_state.current_track_from_transfer(&transfer) {
             Err(why) => warn!("didn't find initial track: {why}"),
@@ -1077,44 +1115,47 @@ impl SpircTask {
 
         let autoplay = self.connect_state.current_track(|t| t.is_autoplay());
         if autoplay {
-            ctx_uri = ctx_uri.replace("station:", "");
+            ctx_uri = ctx_uri.map(|c| c.replace("station:", ""));
         }
 
         let fallback = self.connect_state.current_track(|t| &t.uri).clone();
-        let load_from_context_uri = !ctx_uri.is_empty();
+        let load_from_context_uri = ctx_uri.is_some();
 
-        if load_from_context_uri {
-            self.context_resolver.add(ResolveContext::from_uri(
-                ctx_uri.clone(),
-                &fallback,
-                ContextType::Default,
-                ContextAction::Replace,
-            ));
-        } else {
-            self.load_context_from_tracks(
-                transfer
+        match ctx_uri {
+            Some(ref uri) => {
+                self.context_resolver.add(ResolveContext::from_uri(
+                    uri.clone(),
+                    &fallback,
+                    ContextType::Default,
+                    ContextAction::Replace,
+                ));
+            }
+            None => {
+                let all_tracks = transfer
                     .current_session
                     .context
                     .pages
                     .iter()
                     .cloned()
                     .flat_map(|p| p.tracks)
-                    .collect::<Vec<_>>(),
-            )?
-        }
+                    .collect::<Vec<_>>();
 
-        self.context_resolver.add(ResolveContext::from_uri(
-            ctx_uri.clone(),
-            &fallback,
-            ContextType::Default,
-            ContextAction::Replace,
-        ));
+                if !all_tracks.is_empty() {
+                    self.load_context_from_tracks(all_tracks)?;
+                } else {
+                    warn!(
+                        "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
+                    );
+                    ctx_uri = Some(fallback.clone())
+                }
+            }
+        };
+
+        self.handle_activate();
 
         let timestamp = self.now_ms();
         let state = &mut self.connect_state;
-
-        state.set_active(true);
-        state.handle_initial_transfer(&mut transfer);
+        state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
 
         // adjust active context, so resolve knows for which context it should set up the state
         state.active_context = if autoplay {
@@ -1138,24 +1179,34 @@ impl SpircTask {
         let is_playing = !transfer.playback.is_paused();
 
         if self.connect_state.current_track(|t| t.is_autoplay()) || autoplay {
-            debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
-
-            self.context_resolver.add(ResolveContext::from_uri(
-                ctx_uri,
-                fallback,
-                ContextType::Autoplay,
-                ContextAction::Replace,
-            ))
+            if let Some(ctx_uri) = ctx_uri {
+                debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
+                self.context_resolver.add(ResolveContext::from_uri(
+                    ctx_uri,
+                    fallback,
+                    ContextType::Autoplay,
+                    ContextAction::Replace,
+                ))
+            } else {
+                warn!("couldn't resolve autoplay context without a context uri");
+            }
         }
 
         if load_from_context_uri {
             self.transfer_state = Some(transfer);
         } else {
-            let ctx = self.connect_state.get_context(ContextType::Default)?;
-            let idx = ConnectState::find_index_in_context(ctx, |pt| {
-                self.connect_state.current_track(|t| pt.uri == t.uri)
-            })?;
-            self.connect_state.reset_playback_to_position(Some(idx))?;
+            match self.connect_state.get_context(ContextType::Default) {
+                Err(why) => {
+                    warn!("continuing transfer in an unknown state. {why}");
+                    self.transfer_state = Some(transfer);
+                }
+                Ok(ctx) => {
+                    let idx = ConnectState::find_index_in_context(ctx, |pt| {
+                        self.connect_state.current_track(|t| pt.uri == t.uri)
+                    })?;
+                    self.connect_state.reset_playback_to_position(Some(idx))?;
+                }
+            }
         }
 
         self.load_track(is_playing, position.try_into()?)
@@ -1170,12 +1221,6 @@ impl SpircTask {
         self.notify().await?;
 
         self.connect_state.became_inactive(&self.session).await?;
-
-        // this should clear the active session id, leaving an empty state
-        self.session
-            .spclient()
-            .delete_connect_state_request()
-            .await?;
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
@@ -1226,6 +1271,7 @@ impl SpircTask {
         &mut self,
         cmd: LoadRequest,
         page: Option<ContextPage>,
+        fallback_index: Option<usize>,
     ) -> Result<(), Error> {
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
@@ -1262,17 +1308,26 @@ impl SpircTask {
         let index = match cmd_options.playing_track {
             None => None,
             Some(ref playing_track) => Some(match playing_track {
-                PlayingTrack::Index(i) => *i as usize,
+                PlayingTrack::Index(i) => Ok(*i as usize),
                 PlayingTrack::Uri(uri) => {
                     let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)?
+                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
                 }
                 PlayingTrack::Uid(uid) => {
                     let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)?
+                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)
                 }
             }),
-        };
+        }
+        .map(|i| {
+            i.unwrap_or_else(|why| {
+                warn!(
+                    "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
+                    cmd_options.playing_track, fallback_index
+                );
+                fallback_index.unwrap_or_default()
+            })
+        });
 
         if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
             debug!(
@@ -1296,7 +1351,7 @@ impl SpircTask {
             if self.context_resolver.has_next() {
                 self.connect_state.update_queue_revision()
             } else {
-                self.connect_state.shuffle(None)?;
+                self.connect_state.shuffle_new()?;
                 self.add_autoplay_resolving_when_required();
             }
         } else {
@@ -1365,7 +1420,11 @@ impl SpircTask {
     }
 
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
+        const WEB_API_URI: &str = "spotify:web-api";
         let ctx = Context {
+            // by providing values for uri/url the player in the official client's isn't frozen
+            uri: Some(WEB_API_URI.into()),
+            url: Some(format!("context://{WEB_API_URI}")),
             pages: vec![tracks.into()],
             ..Default::default()
         };
@@ -1508,7 +1567,7 @@ impl SpircTask {
     }
 
     // Mark unavailable tracks so we can skip them later
-    fn handle_unavailable(&mut self, track_id: SpotifyId) -> Result<(), Error> {
+    fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
         self.connect_state.mark_unavailable(track_id)?;
         self.handle_preload_next_track();
 
@@ -1624,7 +1683,9 @@ impl SpircTask {
         let uri = String::from_utf8(uri)?;
 
         if self.connect_state.context_uri() != &uri {
-            debug!("ignoring playlist modification update for playlist <{uri}>, because it isn't the current context");
+            debug!(
+                "ignoring playlist modification update for playlist <{uri}>, because it isn't the current context"
+            );
             return Ok(());
         }
 
@@ -1711,7 +1772,7 @@ impl SpircTask {
         }
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
-        let id = SpotifyId::from_uri(current_uri)?;
+        let id = SpotifyUri::from_uri(current_uri)?;
         self.player.load(id, start_playing, position_ms);
 
         self.connect_state
@@ -1743,7 +1804,7 @@ impl SpircTask {
     }
 
     fn set_volume(&mut self, volume: u16) {
-        debug!("SpircTask::set_volume({})", volume);
+        debug!("SpircTask::set_volume({volume})");
 
         let old_volume = self.connect_state.device_info().volume;
         let new_volume = volume as u32;

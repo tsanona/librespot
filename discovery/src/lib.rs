@@ -211,7 +211,9 @@ async fn avahi_task(
                     break 'wait_avahi;
                 }
             }
-            log::warn!("Failed to connect to Avahi, zeroconf discovery will not work until avahi-daemon is started. Check that it is installed and running");
+            log::warn!(
+                "Failed to connect to Avahi, zeroconf discovery will not work until avahi-daemon is started. Check that it is installed and running"
+            );
 
             // If it didn't, wait for the signal
             match stream.next().await {
@@ -404,12 +406,7 @@ fn launch_libmdns(
             }
             .map_err(|e| DiscoveryError::DnsSdError(Box::new(e)))?;
 
-            let svc = responder.register(
-                DNS_SD_SERVICE_NAME.to_owned(),
-                name.into_owned(),
-                port,
-                &TXT_RECORD,
-            );
+            let svc = responder.register(DNS_SD_SERVICE_NAME, &name, port, &TXT_RECORD);
 
             let _ = shutdown_rx.blocking_recv();
 
@@ -419,7 +416,7 @@ fn launch_libmdns(
         };
 
         if let Err(e) = inner() {
-            log::error!("libmdns error: {}", e);
+            log::error!("libmdns error: {e}");
             let _ = status_tx.send(DiscoveryEvent::ZeroconfError(e));
         }
     });
@@ -440,6 +437,7 @@ impl Builder {
                 is_group: false,
                 device_id: device_id.into(),
                 client_id: client_id.into(),
+                aliases: Vec::new(),
             },
             port: 0,
             zeroconf_ip: vec![],
@@ -462,6 +460,21 @@ impl Builder {
     /// Sets whether the device is a group. This affects the icon in Spotify clients. Default is `false`.
     pub fn is_group(mut self, is_group: bool) -> Self {
         self.server_config.is_group = is_group;
+        self
+    }
+
+    /// Adds an alias for this device. Multiple aliases can be added by calling this method multiple times.
+    pub fn add_alias(
+        mut self,
+        alias: impl Into<Cow<'static, str>>,
+        id: u32,
+        is_group: bool,
+    ) -> Self {
+        self.server_config.aliases.push(server::Alias {
+            name: alias.into(),
+            id,
+            is_group,
+        });
         self
     }
 

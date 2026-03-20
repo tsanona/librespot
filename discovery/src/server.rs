@@ -6,13 +6,13 @@ use std::{
 };
 
 use aes::cipher::{KeyIvInit, StreamCipher};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures_util::{FutureExt, TryFutureExt};
 use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 
 use hyper_util::{rt::TokioIo, server::graceful::GracefulShutdown};
 use log::{debug, error, warn};
@@ -24,12 +24,18 @@ use super::{DiscoveryError, DiscoveryEvent};
 
 use crate::{
     core::config::DeviceType,
-    core::{authentication::Credentials, diffie_hellman::DhLocalKeys, Error},
+    core::{Error, authentication::Credentials, diffie_hellman::DhLocalKeys},
 };
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 type Params<'a> = BTreeMap<Cow<'a, str>, Cow<'a, str>>;
+
+pub struct Alias {
+    pub name: Cow<'static, str>,
+    pub id: u32,
+    pub is_group: bool,
+}
 
 pub struct Config {
     pub name: Cow<'static, str>,
@@ -37,6 +43,7 @@ pub struct Config {
     pub device_id: String,
     pub is_group: bool,
     pub client_id: String,
+    pub aliases: Vec<Alias>,
 }
 
 struct RequestHandler {
@@ -51,7 +58,7 @@ impl RequestHandler {
         Self {
             config,
             username: Mutex::new(None),
-            keys: DhLocalKeys::random(&mut rand::thread_rng()),
+            keys: DhLocalKeys::random(&mut rand::rng()),
             event_tx,
         }
     }
@@ -110,6 +117,13 @@ impl RequestHandler {
             // undocumented but should still work
             "accountReq": "PREMIUM",
             "activeUser": active_user,
+            "aliases": self.config.aliases.iter().map(|alias| {
+                json!({
+                    "name": alias.name,
+                    "id": alias.id.to_string(),
+                    "isGroup": alias.is_group.to_string(),
+                })
+            }).collect::<Vec<_>>(),
             // others seen-in-the-wild:
             // - "deviceAPI_isGroup": False
         })
@@ -170,7 +184,7 @@ impl RequestHandler {
             .map_err(|_| DiscoveryError::HmacError(base_key.to_vec()))?;
         h.update(encrypted);
         if h.verify_slice(cksum).is_err() {
-            warn!("Login error for user {:?}: MAC mismatch", username);
+            warn!("Login error for user {username:?}: MAC mismatch");
             let result = json!({
                 "status": 102,
                 "spotifyError": 1,
@@ -314,7 +328,7 @@ impl DiscoveryServer {
                             discovery
                                 .clone()
                                 .handle(request)
-                                .inspect_err(|e| error!("could not handle discovery request: {}", e))
+                                .inspect_err(|e| error!("could not handle discovery request: {e}"))
                                 .and_then(|x| async move { Ok(x) })
                                 .map(Result::unwrap) // guaranteed by `and_then` above
                         });

@@ -1,12 +1,14 @@
 use std::{
     fmt::Write,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
 
-use crate::config::{os_version, OS};
+use crate::config::{OS, os_version};
 use crate::{
+    Error, FileId, SpotifyId, SpotifyUri,
     apresolve::SocketAddress,
     config::SessionConfig,
+    dealer::protocol::TransferOptions,
     error::ErrorKind,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
@@ -17,23 +19,25 @@ use crate::{
         connect::PutStateRequest,
         context::Context,
         extended_metadata::BatchedEntityRequest,
+        extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
+        extension_kind::ExtensionKind,
     },
     token::Token,
     util,
     version::spotify_semantic_version,
-    Error, FileId, SpotifyId,
 };
 use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
-use http::{header::HeaderValue, Uri};
+use http::{Uri, header::HeaderValue};
 use hyper::{
-    header::{HeaderName, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RANGE},
     HeaderMap, Method, Request,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
 };
 use hyper_util::client::legacy::ResponseFuture;
-use protobuf::{Enum, Message, MessageFull};
+use protobuf::{Enum, EnumOrUnknown, Message, MessageFull};
 use rand::RngCore;
+use serde::Serialize;
 use sysinfo::System;
 use thiserror::Error;
 
@@ -58,18 +62,14 @@ const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
     base_url: None,
 };
 
-const SPCLIENT_FALLBACK_ENDPOINT: RequestOptions = RequestOptions {
-    metrics: true,
-    salt: true,
-    base_url: Some("https://spclient.wg.spotify.com"),
-};
-
 #[derive(Debug, Error)]
 pub enum SpClientError {
     #[error("missing attribute {0}")]
     Attribute(String),
     #[error("expected data but received none")]
     NoData,
+    #[error("expected an entry to exist in {0}")]
+    ExpectedEntry(&'static str),
 }
 
 impl From<SpClientError> for Error {
@@ -104,6 +104,11 @@ impl Default for RequestOptions {
             base_url: None,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransferRequest {
+    pub transfer_options: TransferOptions,
 }
 
 impl SpClient {
@@ -311,20 +316,12 @@ impl SpClient {
                                         continue;
                                     }
                                     Err(e) => {
-                                        trace!(
-                                            "Answer not accepted {}/{}: {}",
-                                            count,
-                                            MAX_TRIES,
-                                            e
-                                        );
+                                        trace!("Answer not accepted {count}/{MAX_TRIES}: {e}");
                                     }
                                 }
                             }
                             Err(e) => trace!(
-                                "Unable to solve hash cash challenge {}/{}: {}",
-                                count,
-                                MAX_TRIES,
-                                e
+                                "Unable to solve hash cash challenge {count}/{MAX_TRIES}: {e}"
                             ),
                         }
 
@@ -343,7 +340,7 @@ impl SpClient {
                 Some(unknown) => {
                     return Err(Error::unimplemented(format!(
                         "Unknown client token response type: {unknown:?}"
-                    )))
+                    )));
                 }
                 None => return Err(Error::failed_precondition("No client token response type")),
             }
@@ -367,13 +364,13 @@ impl SpClient {
                     .iter()
                     .map(|d| d.domain.clone())
                     .collect(),
-                timestamp: Instant::now(),
+                timestamp: SystemTime::now(),
             };
 
             inner.client_token = Some(client_token);
         });
 
-        trace!("Got client token: {:?}", granted_token);
+        trace!("Got client token: {granted_token:?}");
 
         Ok(access_token)
     }
@@ -425,7 +422,7 @@ impl SpClient {
         let mut headers = headers.unwrap_or_default();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-        self.request(method, endpoint, Some(headers), body.map(|s| s.as_bytes()))
+        self.request(method, endpoint, Some(headers), body.map(str::as_bytes))
             .await
     }
 
@@ -483,22 +480,26 @@ impl SpClient {
                     url,
                     "{}salt={}",
                     util::get_next_query_separator(&url),
-                    rand::thread_rng().next_u32()
+                    rand::rng().next_u32()
                 );
             }
 
             let mut request = Request::builder()
                 .method(method)
                 .uri(url)
+                .header(CONTENT_LENGTH, body.len())
                 .body(Bytes::copy_from_slice(body))?;
 
             // Reconnection logic: keep getting (cached) tokens because they might have expired.
             let token = self.session().login5().auth_token().await?;
 
             let headers_mut = request.headers_mut();
-            if let Some(ref hdrs) = headers {
-                *headers_mut = hdrs.clone();
+            if let Some(ref headers) = headers {
+                for (name, value) in headers {
+                    headers_mut.insert(name, value.clone());
+                }
             }
+
             headers_mut.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token,))?,
@@ -542,7 +543,7 @@ impl SpClient {
                 }
             }
 
-            debug!("Error was: {:?}", last_response);
+            debug!("Error was: {last_response:?}");
         }
 
         last_response
@@ -576,43 +577,75 @@ impl SpClient {
             .await
     }
 
-    pub async fn get_metadata(&self, scope: &str, id: &SpotifyId) -> SpClientResult {
-        let endpoint = format!("/metadata/4/{}/{}", scope, id.to_base16()?);
-        // For unknown reasons, metadata requests must now be sent through spclient.wg.spotify.com.
-        // Otherwise, the API will respond with 500 Internal Server Error responses.
-        // Context: https://github.com/librespot-org/librespot/issues/1527
-        self.request_with_options(
-            &Method::GET,
-            &endpoint,
-            None,
-            None,
-            &SPCLIENT_FALLBACK_ENDPOINT,
-        )
-        .await
+    pub async fn get_extended_metadata(
+        &self,
+        request: BatchedEntityRequest,
+    ) -> Result<BatchedExtensionResponse, Error> {
+        let res = self
+            .request_with_protobuf(
+                &Method::POST,
+                "/extended-metadata/v0/extended-metadata",
+                None,
+                &request,
+            )
+            .await?;
+        Ok(BatchedExtensionResponse::parse_from_bytes(&res)?)
     }
 
-    pub async fn get_track_metadata(&self, track_id: &SpotifyId) -> SpClientResult {
-        self.get_metadata("track", track_id).await
+    pub async fn get_metadata(&self, kind: ExtensionKind, id: &SpotifyUri) -> SpClientResult {
+        let req = BatchedEntityRequest {
+            entity_request: vec![EntityRequest {
+                entity_uri: id.to_uri(),
+                query: vec![ExtensionQuery {
+                    extension_kind: EnumOrUnknown::new(kind),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut res = self.get_extended_metadata(req).await?;
+        let mut extended_metadata = res
+            .extended_metadata
+            .pop()
+            .ok_or(SpClientError::ExpectedEntry("extended_metadata"))?;
+
+        let mut data = extended_metadata
+            .extension_data
+            .pop()
+            .ok_or(SpClientError::ExpectedEntry("extension_data"))?;
+
+        match data.extension_data.take() {
+            None => Err(SpClientError::ExpectedEntry("data").into()),
+            Some(data) => Ok(Bytes::from(data.value)),
+        }
     }
 
-    pub async fn get_episode_metadata(&self, episode_id: &SpotifyId) -> SpClientResult {
-        self.get_metadata("episode", episode_id).await
+    pub async fn get_track_metadata(&self, track_uri: &SpotifyUri) -> SpClientResult {
+        self.get_metadata(ExtensionKind::TRACK_V4, track_uri).await
     }
 
-    pub async fn get_album_metadata(&self, album_id: &SpotifyId) -> SpClientResult {
-        self.get_metadata("album", album_id).await
+    pub async fn get_episode_metadata(&self, episode_uri: &SpotifyUri) -> SpClientResult {
+        self.get_metadata(ExtensionKind::EPISODE_V4, episode_uri)
+            .await
     }
 
-    pub async fn get_artist_metadata(&self, artist_id: &SpotifyId) -> SpClientResult {
-        self.get_metadata("artist", artist_id).await
+    pub async fn get_album_metadata(&self, album_uri: &SpotifyUri) -> SpClientResult {
+        self.get_metadata(ExtensionKind::ALBUM_V4, album_uri).await
     }
 
-    pub async fn get_show_metadata(&self, show_id: &SpotifyId) -> SpClientResult {
-        self.get_metadata("show", show_id).await
+    pub async fn get_artist_metadata(&self, artist_uri: &SpotifyUri) -> SpClientResult {
+        self.get_metadata(ExtensionKind::ARTIST_V4, artist_uri)
+            .await
+    }
+
+    pub async fn get_show_metadata(&self, show_uri: &SpotifyUri) -> SpClientResult {
+        self.get_metadata(ExtensionKind::SHOW_V4, show_uri).await
     }
 
     pub async fn get_lyrics(&self, track_id: &SpotifyId) -> SpClientResult {
-        let endpoint = format!("/color-lyrics/v2/track/{}", track_id.to_base62()?);
+        let endpoint = format!("/color-lyrics/v2/track/{}", track_id.to_base62());
 
         self.request_as_json(&Method::GET, &endpoint, None, None)
             .await
@@ -625,7 +658,7 @@ impl SpClient {
     ) -> SpClientResult {
         let endpoint = format!(
             "/color-lyrics/v2/track/{}/image/spotify:image:{}",
-            track_id.to_base62()?,
+            track_id.to_base62(),
             image_id
         );
 
@@ -634,7 +667,7 @@ impl SpClient {
     }
 
     pub async fn get_playlist(&self, playlist_id: &SpotifyId) -> SpClientResult {
-        let endpoint = format!("/playlist/v2/playlist/{}", playlist_id.to_base62()?);
+        let endpoint = format!("/playlist/v2/playlist/{}", playlist_id.to_base62());
 
         self.request(&Method::GET, &endpoint, None, None).await
     }
@@ -680,10 +713,10 @@ impl SpClient {
             .await
     }
 
-    pub async fn get_radio_for_track(&self, track_id: &SpotifyId) -> SpClientResult {
+    pub async fn get_radio_for_track(&self, track_uri: &SpotifyUri) -> SpClientResult {
         let endpoint = format!(
             "/inspiredby-mix/v2/seed_to_playlist/{}?response-format=json",
-            track_id.to_uri()?
+            track_uri.to_uri()
         );
 
         self.request_as_json(&Method::GET, &endpoint, None, None)
@@ -716,8 +749,8 @@ impl SpClient {
 
         let previous_track_str = previous_tracks
             .iter()
-            .map(|track| track.to_base62())
-            .collect::<Result<Vec<_>, _>>()?
+            .map(SpotifyId::to_base62)
+            .collect::<Vec<_>>()
             .join(",");
         // better than checking `previous_tracks.len() > 0` because the `filter_map` could still return 0 items
         if !previous_track_str.is_empty() {
@@ -737,16 +770,10 @@ impl SpClient {
     // TODO: Seen-in-the-wild but unimplemented endpoints
     // - /presence-view/v1/buddylist
 
-    pub async fn get_extended_metadata(&self, request: BatchedEntityRequest) -> SpClientResult {
-        let endpoint = "/extended-metadata/v0/extended-metadata";
-        self.request_with_protobuf(&Method::POST, endpoint, None, &request)
-            .await
-    }
-
     pub async fn get_audio_storage(&self, file_id: &FileId) -> SpClientResult {
         let endpoint = format!(
             "/storage-resolve/files/audio/interactive/{}",
-            file_id.to_base16()?
+            file_id.to_base16()
         );
         self.request(&Method::GET, &endpoint, None, None).await
     }
@@ -786,13 +813,13 @@ impl SpClient {
 
     // Audio preview in 96 kbps MP3, unencrypted
     pub async fn get_audio_preview(&self, preview_id: &FileId) -> SpClientResult {
-        let attribute = "audio-preview-url-template";
+        const ATTRIBUTE: &str = "audio-preview-url-template";
         let template = self
             .session()
-            .get_user_attribute(attribute)
-            .ok_or_else(|| SpClientError::Attribute(attribute.to_string()))?;
+            .get_user_attribute(ATTRIBUTE)
+            .ok_or_else(|| SpClientError::Attribute(ATTRIBUTE.to_string()))?;
 
-        let mut url = template.replace("{id}", &preview_id.to_base16()?);
+        let mut url = template.replace("{id}", &preview_id.to_base16());
         let separator = match url.find('?') {
             Some(_) => "&",
             None => "?",
@@ -804,24 +831,24 @@ impl SpClient {
 
     // The first 128 kB of a track, unencrypted
     pub async fn get_head_file(&self, file_id: &FileId) -> SpClientResult {
-        let attribute = "head-files-url";
+        const ATTRIBUTE: &str = "head-files-url";
         let template = self
             .session()
-            .get_user_attribute(attribute)
-            .ok_or_else(|| SpClientError::Attribute(attribute.to_string()))?;
+            .get_user_attribute(ATTRIBUTE)
+            .ok_or_else(|| SpClientError::Attribute(ATTRIBUTE.to_string()))?;
 
-        let url = template.replace("{file_id}", &file_id.to_base16()?);
+        let url = template.replace("{file_id}", &file_id.to_base16());
 
         self.request_url(&url).await
     }
 
     pub async fn get_image(&self, image_id: &FileId) -> SpClientResult {
-        let attribute = "image-url";
+        const ATTRIBUTE: &str = "image-url";
         let template = self
             .session()
-            .get_user_attribute(attribute)
-            .ok_or_else(|| SpClientError::Attribute(attribute.to_string()))?;
-        let url = template.replace("{file_id}", &image_id.to_base16()?);
+            .get_user_attribute(ATTRIBUTE)
+            .ok_or_else(|| SpClientError::Attribute(ATTRIBUTE.to_string()))?;
+        let url = template.replace("{file_id}", &image_id.to_base16());
 
         self.request_url(&url).await
     }
@@ -900,8 +927,34 @@ impl SpClient {
     pub async fn get_rootlist(&self, from: usize, length: Option<usize>) -> SpClientResult {
         let length = length.unwrap_or(120);
         let user = self.session().username();
-        let endpoint = format!("/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}");
+        let endpoint = format!(
+            "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}"
+        );
 
         self.request(&Method::GET, &endpoint, None, None).await
+    }
+
+    /// Triggers the transfers of the playback from one device to another
+    ///
+    /// Using the same `device_id` for `from_device_id` and `to_device_id`, initiates the transfer
+    /// from the currently active device.
+    pub async fn transfer(
+        &self,
+        from_device_id: &str,
+        to_device_id: &str,
+        transfer_request: Option<&TransferRequest>,
+    ) -> SpClientResult {
+        let body = transfer_request.map(serde_json::to_string).transpose()?;
+
+        let endpoint =
+            format!("/connect-state/v1/connect/transfer/from/{from_device_id}/to/{to_device_id}");
+        self.request_with_options(
+            &Method::POST,
+            &endpoint,
+            None,
+            body.as_deref().map(str::as_bytes),
+            &NO_METRICS_AND_SALT,
+        )
+        .await
     }
 }

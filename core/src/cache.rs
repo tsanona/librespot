@@ -1,18 +1,21 @@
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     cmp::Reverse,
     collections::HashMap,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::SystemTime,
 };
 
-use parking_lot::Mutex;
 use priority_queue::PriorityQueue;
 use thiserror::Error;
 
-use crate::{authentication::Credentials, error::ErrorKind, Error, FileId};
+use crate::{Error, FileId, authentication::Credentials, error::ErrorKind};
+
+const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -141,7 +144,7 @@ impl FsSizeLimiter {
         let list_dir = match fs::read_dir(path) {
             Ok(list_dir) => list_dir,
             Err(e) => {
-                warn!("Could not read directory {:?} in cache dir: {}", path, e);
+                warn!("Could not read directory {path:?} in cache dir: {e}");
                 return;
             }
         };
@@ -150,7 +153,7 @@ impl FsSizeLimiter {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    warn!("Could not directory {:?} in cache dir: {}", path, e);
+                    warn!("Could not directory {path:?} in cache dir: {e}");
                     return;
                 }
             };
@@ -166,7 +169,7 @@ impl FsSizeLimiter {
                             limiter.add(&path, size, access_time);
                         }
                         Err(e) => {
-                            warn!("Could not read file {:?} in cache dir: {}", path, e)
+                            warn!("Could not read file {path:?} in cache dir: {e}")
                         }
                     }
                 }
@@ -189,15 +192,24 @@ impl FsSizeLimiter {
     }
 
     fn add(&self, file: &Path, size: u64) {
-        self.limiter.lock().add(file, size, SystemTime::now())
+        self.limiter
+            .lock()
+            .expect(CACHE_LIMITER_POISON_MSG)
+            .add(file, size, SystemTime::now())
     }
 
     fn touch(&self, file: &Path) -> bool {
-        self.limiter.lock().update(file, SystemTime::now())
+        self.limiter
+            .lock()
+            .expect(CACHE_LIMITER_POISON_MSG)
+            .update(file, SystemTime::now())
     }
 
     fn remove(&self, file: &Path) -> bool {
-        self.limiter.lock().remove(file)
+        self.limiter
+            .lock()
+            .expect(CACHE_LIMITER_POISON_MSG)
+            .remove(file)
     }
 
     fn prune_internal<F: FnMut() -> Option<PathBuf>>(mut pop: F) -> Result<(), Error> {
@@ -213,7 +225,7 @@ impl FsSizeLimiter {
 
             let res = fs::remove_file(&file);
             if let Err(e) = res {
-                warn!("Could not remove file {:?} from cache dir: {}", file, e);
+                warn!("Could not remove file {file:?} from cache dir: {e}");
                 last_error = Some(e);
             } else {
                 count += 1;
@@ -221,7 +233,7 @@ impl FsSizeLimiter {
         }
 
         if count > 0 {
-            info!("Removed {} cache files.", count);
+            info!("Removed {count} cache files.");
         }
 
         if let Some(err) = last_error {
@@ -232,7 +244,7 @@ impl FsSizeLimiter {
     }
 
     fn prune(&self) -> Result<(), Error> {
-        Self::prune_internal(|| self.limiter.lock().pop())
+        Self::prune_internal(|| self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).pop())
     }
 
     fn new(path: &Path, limit: u64) -> Result<Self, Error> {
@@ -305,10 +317,14 @@ impl Cache {
 
         // This closure is just convencience to enable the question mark operator
         let read = || -> Result<Credentials, Error> {
-            let mut file = File::open(location)?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)?;
-            Ok(serde_json::from_str(&contents)?)
+            let file = File::open(location)?;
+            #[cfg(unix)]
+            if file.metadata()?.mode() & 0o004 != 0 {
+                warn!(
+                    "credential file {location:?} is currently world readable, consider using  chmod 600 {location:?} to fix this"
+                )
+            }
+            Ok(serde_json::from_reader(file)?)
         };
 
         match read() {
@@ -317,7 +333,7 @@ impl Cache {
                 // If the file did not exist, the file was probably not written
                 // before. Otherwise, log the error.
                 if e.kind != ErrorKind::NotFound {
-                    warn!("Error reading credentials from cache: {}", e);
+                    warn!("Error reading credentials from cache: {e}");
                 }
                 None
             }
@@ -326,13 +342,18 @@ impl Cache {
 
     pub fn save_credentials(&self, cred: &Credentials) {
         if let Some(location) = &self.credentials_location {
-            let result = File::create(location).and_then(|mut file| {
-                let data = serde_json::to_string(cred)?;
-                write!(file, "{data}")
-            });
+            let mut file = File::options();
+            #[cfg(unix)]
+            let file = file.mode(0o600);
+            let result = file
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(location)
+                .and_then(|file| Ok(serde_json::to_writer(file, cred)?));
 
             if let Err(e) = result {
-                warn!("Cannot save credentials to cache: {}", e)
+                warn!("Cannot save credentials to cache: {e}")
             }
         }
     }
@@ -351,7 +372,7 @@ impl Cache {
             Ok(v) => Some(v),
             Err(e) => {
                 if e.kind != ErrorKind::NotFound {
-                    warn!("Error reading volume from cache: {}", e);
+                    warn!("Error reading volume from cache: {e}");
                 }
                 None
             }
@@ -362,23 +383,18 @@ impl Cache {
         if let Some(ref location) = self.volume_location {
             let result = File::create(location).and_then(|mut file| write!(file, "{volume}"));
             if let Err(e) = result {
-                warn!("Cannot save volume to cache: {}", e);
+                warn!("Cannot save volume to cache: {e}");
             }
         }
     }
 
     pub fn file_path(&self, file: FileId) -> Option<PathBuf> {
-        match file.to_base16() {
-            Ok(name) => self.audio_location.as_ref().map(|location| {
-                let mut path = location.join(&name[0..2]);
-                path.push(&name[2..]);
-                path
-            }),
-            Err(e) => {
-                warn!("Invalid FileId: {}", e);
-                None
-            }
-        }
+        self.audio_location.as_ref().map(|location| {
+            let name = file.to_base16();
+            let mut path = location.join(&name[0..2]);
+            path.push(&name[2..]);
+            path
+        })
     }
 
     pub fn file(&self, file: FileId) -> Option<File> {
@@ -387,14 +403,14 @@ impl Cache {
             Ok(file) => {
                 if let Some(limiter) = self.size_limiter.as_deref() {
                     if !limiter.touch(&path) {
-                        error!("limiter could not touch {:?}", path);
+                        error!("limiter could not touch {path:?}");
                     }
                 }
                 Some(file)
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotFound {
-                    warn!("Error reading file from cache: {}", e)
+                    warn!("Error reading file from cache: {e}")
                 }
                 None
             }

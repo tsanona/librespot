@@ -1,8 +1,8 @@
 use std::io::{self, Read};
 
 use aes::Aes192;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use byteorder::{BigEndian, ByteOrder};
 use pbkdf2::pbkdf2_hmac;
 use protobuf::Enum;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 
-use crate::{protocol::authentication::AuthenticationType, Error};
+use crate::{Error, protocol::authentication::AuthenticationType};
 
 #[derive(Debug, Error)]
 pub enum AuthenticationError {
@@ -66,6 +66,7 @@ impl Credentials {
         }
     }
 
+    #[expect(deprecated)]
     pub fn with_blob(
         username: impl Into<String>,
         encrypted_blob: impl AsRef<[u8]>,

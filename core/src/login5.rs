@@ -1,22 +1,22 @@
 use crate::config::OS;
 use crate::spclient::CLIENT_TOKEN;
 use crate::token::Token;
-use crate::{util, Error, SessionConfig};
+use crate::{Error, SessionConfig, util};
 use bytes::Bytes;
-use http::{header::ACCEPT, HeaderValue, Method, Request};
+use http::{HeaderValue, Method, Request, header::ACCEPT};
 use librespot_protocol::login5::login_response::Response;
 use librespot_protocol::{
     client_info::ClientInfo,
     credentials::{Password, StoredCredential},
     hashcash::HashcashSolution,
     login5::{
-        login_request::Login_method, ChallengeSolution, LoginError, LoginOk, LoginRequest,
-        LoginResponse,
+        ChallengeSolution, LoginError, LoginOk, LoginRequest, LoginResponse,
+        login_request::Login_method,
     },
 };
 use protobuf::well_known_types::duration::Duration as ProtoDuration;
 use protobuf::{Message, MessageField};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::time::sleep;
 
@@ -199,7 +199,7 @@ impl Login5Manager {
             inner.auth_token.clone()
         });
 
-        trace!("Got auth token: {:?}", auth_token);
+        trace!("Got auth token: {auth_token:?}");
 
         token.ok_or(Login5Error::NoStoredCredentials.into())
     }
@@ -264,7 +264,7 @@ impl Login5Manager {
             expires_in: Duration::from_secs(expires_in.try_into().unwrap_or(3600)),
             token_type: "Bearer".to_string(),
             scopes: vec![],
-            timestamp: Instant::now(),
+            timestamp: SystemTime::now(),
         }
     }
 }

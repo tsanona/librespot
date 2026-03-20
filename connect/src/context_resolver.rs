@@ -4,7 +4,7 @@ use crate::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
     },
-    state::{context::ContextType, ConnectState},
+    state::{ConnectState, context::ContextType},
 };
 use std::{
     cmp::PartialEq,
@@ -142,7 +142,7 @@ impl ContextResolver {
         let last_try = self
             .unavailable_contexts
             .get(&resolve)
-            .map(|i| i.duration_since(Instant::now()));
+            .map(Instant::elapsed);
 
         let last_try = if matches!(last_try, Some(last_try) if last_try > RETRY_UNAVAILABLE) {
             let _ = self.unavailable_contexts.remove(&resolve);
@@ -318,8 +318,8 @@ impl ContextResolver {
         let active_ctx = state.get_context(state.active_context);
         let res = if let Some(transfer_state) = transfer_state.take() {
             state.finish_transfer(transfer_state)
-        } else if state.shuffling_context() {
-            state.shuffle(None)
+        } else if state.shuffling_context() && next.update == ContextType::Default {
+            state.shuffle_new()
         } else if matches!(active_ctx, Ok(ctx) if ctx.index.track == 0) {
             // has context, and context is not touched
             // when the index is not zero, the next index was already evaluated elsewhere
