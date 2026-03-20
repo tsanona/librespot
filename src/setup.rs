@@ -1679,6 +1679,7 @@ pub async fn get_setup() -> Setup {
             initial_volume,
             disable_volume,
             volume_steps,
+            emit_set_queue_events: false,
         }
     };
 
