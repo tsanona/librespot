@@ -84,6 +84,8 @@ pub struct ConnectConfig {
     pub device_type: DeviceType,
     /// Displays the [DeviceType] twice in the ui to show up as a group (default: false)
     pub is_group: bool,
+    /// If device can be selected for playing (default: true)
+    pub can_play: bool,
     /// The volume with which the connect device will be initialized (default: 50%)
     pub initial_volume: u16,
     /// Disables the option to control the volume remotely (default: false)
@@ -100,10 +102,23 @@ impl Default for ConnectConfig {
             name: "librespot".to_string(),
             device_type: DeviceType::Speaker,
             is_group: false,
+            can_play: true,
             initial_volume: u16::MAX / 2,
             disable_volume: false,
             volume_steps: 64,
             emit_set_queue_events: false,
+        }
+    }
+}
+
+impl ConnectConfig {
+    /// Initilize an oberving connect device that can't play.
+    pub fn observer(name: String) -> Self {
+        Self {
+            name,
+            device_type: DeviceType::Observer,
+            can_play: false,
+            ..Default::default()
         }
     }
 }
@@ -141,7 +156,7 @@ impl ConnectState {
         let volume_step_size = u16::MAX.checked_div(cfg.volume_steps).unwrap_or(1024);
 
         let device_info = DeviceInfo {
-            can_play: true,
+            can_play: cfg.can_play,
             volume: cfg.initial_volume.into(),
             name: cfg.name,
             device_id: session.device_id().to_string(),
@@ -155,7 +170,7 @@ impl ConnectState {
                 disable_volume: cfg.disable_volume,
 
                 gaia_eq_connect_id: true,
-                can_be_player: true,
+                can_be_player: cfg.can_play,
                 needs_full_player_state: true,
                 is_observable: true,
                 is_controllable: true,

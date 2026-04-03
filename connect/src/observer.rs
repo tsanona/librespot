@@ -61,7 +61,8 @@ pub struct Observer {
 }
 
 impl Observer {
-    /// Initializes a new spotify connect device
+    /// Initializes a new spotify connect device as Observer.
+    /// This device cannot be used to play.
     ///
     /// The returned tuple consists out of a handle to the [`Observer`] that
     /// can control the local connect device when active. And a [`Future`]
