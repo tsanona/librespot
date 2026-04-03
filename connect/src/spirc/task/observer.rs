@@ -1,57 +1,29 @@
 use crate::{
-    core::{
-        Error, Session,
-        authentication::Credentials,
-        dealer::{manager::BoxedStreamResult, protocol::Message},
-    },
+    ConnectState, SpircError,
+    core::{Error, dealer::{manager::BoxedStreamResult, protocol::Message}},
     protocol::connect::{Cluster, ClusterUpdate},
-    state::{ConnectConfig, ConnectState},
+    spirc::task::{SPIRC_COUNTER, SpircTask, SpircArgs},
+    unwrap,
 };
 use futures_util::StreamExt;
-use std::{
-    future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-use thiserror::Error;
-use tokio::sync::mpsc;
+use std::sync::atomic::Ordering;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-#[derive(Debug, Error)]
-enum ObserverError {
-    #[error("message pushed for another URI")]
-    InvalidUri(String),
-    #[error("failed to put connect state for new device")]
-    FailedDealerSetup,
-}
-
-impl From<ObserverError> for Error {
-    fn from(err: ObserverError) -> Self {
-        use ObserverError::*;
-        match err {
-            InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
-        }
-    }
-}
-
-struct ObserverTask {
-    task_id: usize,
-
-    connection_id_update: BoxedStreamResult<String>,
+pub struct ObserverTask {
+    id: usize,
 
     /// the state management object
     connect_state: ConnectState,
     connect_state_update: BoxedStreamResult<ClusterUpdate>,
 
-    changes: mpsc::UnboundedSender<ClusterUpdate>,
+    connection_id_update: BoxedStreamResult<String>,
+
+    changes: UnboundedSender<ClusterUpdate>,
 }
 
-static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-/// The spotify connect handle
-pub struct Observer {
-    pub changes: mpsc::UnboundedReceiver<ClusterUpdate>,
-}
-
-impl Observer {
+impl SpircTask for ObserverTask {
+    type Args = SpircArgs;
+    type Interface = UnboundedReceiver<ClusterUpdate>;
     /// Initializes a new spotify connect device as Observer.
     /// This device cannot be used to play.
     ///
@@ -59,27 +31,19 @@ impl Observer {
     /// can control the local connect device when active. And a [`Future`]
     /// which represents the [`Observer`] event loop that processes the whole
     /// connect device logic.
-    pub async fn new(
-        config: ConnectConfig,
-        session: Session,
-        credentials: Credentials,
-    ) -> Result<(Observer, impl Future<Output = ()>), Error> {
-        fn extract_connection_id(msg: Message) -> Result<String, Error> {
-            let connection_id = msg
-                .headers
-                .get("Spotify-Connection-Id")
-                .ok_or_else(|| ObserverError::InvalidUri(msg.uri.clone()))?;
-            Ok(connection_id.to_owned())
-        }
+    async fn new(
+        args: Self::Args
+    ) -> Result<(Self, Self::Interface), Error> {
+        let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
+        debug!("new Spirc[{spirc_id}]");
 
-        let task_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
-        debug!("new Observer[{}]", task_id);
+        let SpircArgs { config, session, credentials } = args;
+
+        let connect_state = ConnectState::new(config, session.clone());
 
         let connection_id_update = session
             .dealer()
-            .listen_for("hm://pusher/v1/connections/", extract_connection_id)?;
-
-        let connect_state = ConnectState::new(config, &session);
+            .listen_for("hm://pusher/v1/connections/", Self::extract_connection_id)?;
 
         let connect_state_update = session
             .dealer()
@@ -95,51 +59,29 @@ impl Observer {
         let _ = session.login5().auth_token().await?;
 
         //let context_resolver = ContextResolver::new(session.clone());
-        let (chngs_tx, chngs_rx) = mpsc::unbounded_channel();
+        let (chngs_tx, chngs_rx) = unbounded_channel();
 
         let task = ObserverTask {
-            task_id,
-
-            connection_id_update,
+            id: spirc_id,
 
             connect_state,
             connect_state_update,
 
+            connection_id_update,
+
             changes: chngs_tx,
         };
 
-        let observer = Observer { changes: chngs_rx };
-
-        Ok((observer, task.run()))
+        Ok((task, chngs_rx))
     }
-}
 
-impl ObserverTask {
     async fn run(mut self) {
-        // simplify unwrapping of received item or parsed result
-        macro_rules! unwrap {
-            ( $next:expr, |$some:ident| $use_some:expr ) => {
-                match $next {
-                    Some($some) => $use_some,
-                    None => {
-                        error!("{} selected, but none received", stringify!($next));
-                        break;
-                    }
-                }
-            };
-            ( $next:expr, match |$ok:ident| $use_ok:expr ) => {
-                unwrap!($next, |$ok| match $ok {
-                    Ok($ok) => $use_ok,
-                    Err(why) => error!("could not parse {}: {}", stringify!($ok), why),
-                })
-            };
-        }
-
         if let Err(why) = self.connect_state.session.dealer().start().await {
             error!("starting dealer failed: {why}");
             return;
         }
 
+        
         while !self.connect_state.session.is_invalid() {
             tokio::select! {
                 // startup of the dealer requires a connection_id, which is retrieved at the very beginning
@@ -163,7 +105,9 @@ impl ObserverTask {
 
         self.connect_state.session.dealer().close().await;
     }
+}
 
+impl ObserverTask {
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
         trace!("Received connection ID update: {:?}", connection_id);
         self.connect_state.session.set_connection_id(&connection_id);
@@ -177,7 +121,7 @@ impl ObserverTask {
                 None
             }
         }
-        .ok_or(ObserverError::FailedDealerSetup)?;
+        .ok_or(SpircError::FailedDealerSetup)?;
 
         debug!(
             "successfully put connect state for {} with connection-id {connection_id}",
@@ -196,11 +140,6 @@ impl ObserverTask {
         } else if cluster.transfer_data.is_empty() {
             debug!("got empty transfer state, do nothing");
             return Ok(());
-        } else {
-            info!(
-                "trying to take over control automatically, session_id: {}",
-                cluster.player_state.session_id
-            )
         }
 
         Ok(())
@@ -220,6 +159,6 @@ impl ObserverTask {
 
 impl Drop for ObserverTask {
     fn drop(&mut self) {
-        debug!("drop Observer[{}]", self.task_id);
+        debug!("drop Observer[{}]", self.id);
     }
 }

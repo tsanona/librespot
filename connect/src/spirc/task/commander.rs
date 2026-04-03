@@ -1,22 +1,12 @@
 use crate::{
-    LoadContextOptions, LoadRequestOptions, PlayContext,
-    context_resolver::{ContextAction, ContextResolver, ResolveContext},
-    core::{
-        Error, Session, SpotifyUri,
-        authentication::Credentials,
+    SpircArgs, SpircCommand, context_resolver::{ContextAction, ContextResolver, ResolveContext}, core::{
+        Error, SpotifyUri,
         dealer::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
             protocol::{Command, FallbackWrapper, Message, Request},
         },
         session::UserAttributes,
-        spclient::TransferRequest,
-    },
-    model::{LoadRequest, PlayingTrack, SpircPlayStatus},
-    playback::{
-        mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel, QueueTrack},
-    },
-    protocol::{
+    }, model::SpircPlayStatus, protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
@@ -25,63 +15,55 @@ use crate::{
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
         user_attributes::UserAttributesMutation,
-    },
-    state::{
-        context::{ContextType, ResetContext},
-        provider::IsProvider,
-        {ConnectConfig, ConnectState},
-    },
+    }, spirc::task::{CONTEXT_FETCH_THRESHOLD, SPIRC_COUNTER, SpircTask, UPDATE_STATE_DELAY, VOLUME_UPDATE_DELAY}, state::{ConnectState, context::ContextType}, unwrap
 };
+
+use crate::SpircError;
+
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
 use protobuf::MessageField;
 use std::{
-    future::Future,
-    sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::atomic::Ordering,
+    time::{SystemTime, UNIX_EPOCH},
 };
-use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc::{self, UnboundedSender},
+    time::sleep,
+};
 
-#[derive(Debug, Error)]
-enum SpircError {
-    #[error("response payload empty")]
-    NoData,
-    #[error("{0} had no uri")]
-    NoUri(&'static str),
-    #[error("message pushed for another URI")]
-    InvalidUri(String),
-    #[error("failed to put connect state for new device")]
-    FailedDealerSetup,
-    #[error("unknown endpoint: {0:#?}")]
-    UnknownEndpoint(serde_json::Value),
-}
+// #[derive(Debug)]
+// pub enum SpircCommand {
+//     Play,
+//     PlayPause,
+//     Pause,
+//     Prev,
+//     Next,
+//     VolumeUp,
+//     VolumeDown,
+//     Shutdown,
+//     Shuffle(bool),
+//     Repeat(bool),
+//     RepeatTrack(bool),
+//     Disconnect { pause: bool },
+//     SetPosition(u32),
+//     SetVolume(u16),
+//     // Activate,
+//     // Transfer(Option<TransferRequest>),
+//     // Load(LoadRequest),
+//     AddToQueue(SpotifyUri),
+// }
 
-impl From<SpircError> for Error {
-    fn from(err: SpircError) -> Self {
-        use SpircError::*;
-        match err {
-            NoData | NoUri(_) => Error::unavailable(err),
-            InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
-            UnknownEndpoint(_) => Error::unimplemented(err),
-        }
-    }
-}
-
-struct SpircTask {
-    player: Arc<Player>,
-    mixer: Arc<dyn Mixer>,
+pub struct CommanderTask {
+    id: usize,
 
     /// the state management object
     connect_state: ConnectState,
+    connect_state_update: BoxedStreamResult<ClusterUpdate>,
+
     connect_established: bool,
 
-    play_request_id: Option<u64>,
-    play_status: SpircPlayStatus,
-
     connection_id_update: BoxedStreamResult<String>,
-    connect_state_update: BoxedStreamResult<ClusterUpdate>,
     connect_state_volume_update: BoxedStreamResult<SetVolumeCommand>,
     connect_state_logout_request: BoxedStreamResult<LogoutCommand>,
     playlist_update: BoxedStreamResult<PlaylistModificationInfo>,
@@ -91,11 +73,11 @@ struct SpircTask {
     user_attributes_mutation: BoxedStreamResult<UserAttributesMutation>,
 
     commands: Option<mpsc::UnboundedReceiver<SpircCommand>>,
-    player_events: Option<PlayerEventChannel>,
+
+    // play_request_id: Option<u64>,
+    play_status: SpircPlayStatus,
 
     context_resolver: ContextResolver,
-
-    emit_set_queue_events: bool,
 
     shutdown: bool,
 
@@ -109,77 +91,25 @@ struct SpircTask {
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
     update_state: bool,
-
-    spirc_id: usize,
 }
 
-static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+impl SpircTask for CommanderTask {
+    type Args = SpircArgs;
+    type Interface = UnboundedSender<SpircCommand>;
 
-#[derive(Debug)]
-enum SpircCommand {
-    Play,
-    PlayPause,
-    Pause,
-    Prev,
-    Next,
-    VolumeUp,
-    VolumeDown,
-    Shutdown,
-    Shuffle(bool),
-    Repeat(bool),
-    RepeatTrack(bool),
-    Disconnect { pause: bool },
-    SetPosition(u32),
-    SetVolume(u16),
-    Activate,
-    Transfer(Option<TransferRequest>),
-    Load(LoadRequest),
-    AddToQueue(SpotifyUri),
-}
-
-const CONTEXT_FETCH_THRESHOLD: usize = 2;
-
-// delay to update volume after a certain amount of time, instead on each update request
-const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
-// to reduce updates to remote, we group some request by waiting for a set amount of time
-const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
-
-/// The spotify connect handle
-pub struct Spirc {
-    commands: mpsc::UnboundedSender<SpircCommand>,
-}
-
-impl Spirc {
-    /// Initializes a new spotify connect device
-    ///
-    /// The returned tuple consists out of a handle to the [`Spirc`] that
-    /// can control the local connect device when active. And a [`Future`]
-    /// which represents the [`Spirc`] event loop that processes the whole
-    /// connect device logic.
-    pub async fn new(
-        config: ConnectConfig,
-        session: Session,
-        credentials: Credentials,
-        player: Arc<Player>,
-        mixer: Arc<dyn Mixer>,
-    ) -> Result<(Spirc, impl Future<Output = ()>), Error> {
-        fn extract_connection_id(msg: Message) -> Result<String, Error> {
-            let connection_id = msg
-                .headers
-                .get("Spotify-Connection-Id")
-                .ok_or_else(|| SpircError::InvalidUri(msg.uri.clone()))?;
-            Ok(connection_id.to_owned())
-        }
-
+    async fn new(
+        args: Self::Args
+    ) -> Result<(Self, Self::Interface), Error> {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
-        let emit_set_queue_events = config.emit_set_queue_events;
-        let connect_state = ConnectState::new(config, &session);
+        let SpircArgs { config, session, credentials } = args;
+
+        let connect_state = ConnectState::new(config, session.clone());
 
         let connection_id_update = session
             .dealer()
-            .listen_for("hm://pusher/v1/connections/", extract_connection_id)?;
+            .listen_for("hm://pusher/v1/connections/", Self::extract_connection_id)?;
 
         let connect_state_update = session
             .dealer()
@@ -225,16 +155,11 @@ impl Spirc {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        let player_events = player.get_player_event_channel();
-
-        let mut task = SpircTask {
-            player,
-            mixer,
-
+        let mut task = CommanderTask {
             connect_state,
             connect_established: false,
 
-            play_request_id: None,
+            // play_request_id: None,
             play_status: SpircPlayStatus::Stopped,
 
             connection_id_update,
@@ -247,11 +172,8 @@ impl Spirc {
             user_attributes_update,
             user_attributes_mutation,
             commands: Some(cmd_rx),
-            player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
-
-            emit_set_queue_events,
 
             shutdown: false,
 
@@ -259,10 +181,10 @@ impl Spirc {
             update_volume: false,
             update_state: false,
 
-            spirc_id,
+            id: spirc_id,
         };
 
-        let spirc = Spirc { commands: cmd_tx };
+        // let spirc = Spirc { commands: cmd_tx };
 
         let initial_volume = task.connect_state.device_info().volume;
         task.connect_state.set_volume(0);
@@ -277,185 +199,10 @@ impl Spirc {
             Err(why) => error!("failed to update initial volume: {why}"),
         };
 
-        Ok((spirc, task.run()))
+        Ok((task, cmd_tx))
     }
 
-    /// Safely shutdowns the spirc.
-    ///
-    /// This pauses the playback, disconnects the connect device and
-    /// bring the future initially returned to an end.
-    pub fn shutdown(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Shutdown)?)
-    }
-
-    /// Resumes the playback
-    ///
-    /// Does nothing if we are not the active device, or it isn't paused.
-    pub fn play(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Play)?)
-    }
-
-    /// Resumes or pauses the playback
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn play_pause(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::PlayPause)?)
-    }
-
-    /// Pauses the playback
-    ///
-    /// Does nothing if we are not the active device, or if it isn't playing.
-    pub fn pause(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Pause)?)
-    }
-
-    /// Seeks to the beginning or skips to the previous track.
-    ///
-    /// Seeks to the beginning when the current track position
-    /// is greater than 3 seconds.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn prev(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Prev)?)
-    }
-
-    /// Skips to the next track.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn next(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Next)?)
-    }
-
-    /// Increases the volume by configured steps of [ConnectConfig].
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn volume_up(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::VolumeUp)?)
-    }
-
-    /// Decreases the volume by configured steps of [ConnectConfig].
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn volume_down(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::VolumeDown)?)
-    }
-
-    /// Shuffles the playback according to the value.
-    ///
-    /// If true shuffles/reshuffles the playback. Otherwise, does
-    /// nothing (if not shuffled) or unshuffles the playback while
-    /// resuming at the position of the current track.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn shuffle(&self, shuffle: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Shuffle(shuffle))?)
-    }
-
-    /// Repeats the playback context according to the value.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn repeat(&self, repeat: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Repeat(repeat))?)
-    }
-
-    /// Repeats the current track if true.
-    ///
-    /// Does nothing if we are not the active device.
-    ///
-    /// Skipping to the next track disables the repeating.
-    pub fn repeat_track(&self, repeat: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::RepeatTrack(repeat))?)
-    }
-
-    /// Update the volume to the given value.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn set_volume(&self, volume: u16) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::SetVolume(volume))?)
-    }
-
-    /// Updates the position to the given value.
-    ///
-    /// Does nothing if we are not the active device.
-    ///
-    /// If value is greater than the track duration,
-    /// the update is ignored.
-    pub fn set_position_ms(&self, position_ms: u32) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::SetPosition(position_ms))?)
-    }
-
-    /// Load a new context and replace the current.
-    ///
-    /// Does nothing if we are not the active device.
-    ///
-    /// Does not overwrite the queue.
-    pub fn load(&self, command: LoadRequest) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Load(command))?)
-    }
-
-    /// Adds a track, episode, album or playlist to the queue.
-    ///
-    /// Does nothing if we are not the active device.
-    ///
-    /// For albums and playlists, all tracks/episodes are resolved and added to the queue.
-    pub fn add_to_queue(&self, uri: SpotifyUri) -> Result<(), Error> {
-        if !matches!(
-            uri,
-            SpotifyUri::Track { .. }
-                | SpotifyUri::Episode { .. }
-                | SpotifyUri::Album { .. }
-                | SpotifyUri::Playlist { .. }
-        ) {
-            return Err(Error::invalid_argument("uri"));
-        }
-        Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
-    }
-
-    /// Disconnects the current device and pauses the playback according the value.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn disconnect(&self, pause: bool) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Disconnect { pause })?)
-    }
-
-    /// Acquires the control as active connect device.
-    ///
-    /// Does not [Spirc::transfer] the playback. Does nothing if we are not the active device.
-    pub fn activate(&self) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Activate)?)
-    }
-
-    /// Acquires the control as active connect device over the transfer flow.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn transfer(&self, transfer_request: Option<TransferRequest>) -> Result<(), Error> {
-        Ok(self
-            .commands
-            .send(SpircCommand::Transfer(transfer_request))?)
-    }
-}
-
-impl SpircTask {
     async fn run(mut self) {
-        // simplify unwrapping of received item or parsed result
-        macro_rules! unwrap {
-            ( $next:expr, |$some:ident| $use_some:expr ) => {
-                match $next {
-                    Some($some) => $use_some,
-                    None => {
-                        error!("{} selected, but none received", stringify!($next));
-                        break;
-                    }
-                }
-            };
-            ( $next:expr, match |$ok:ident| $use_ok:expr ) => {
-                unwrap!($next, |$ok| match $ok {
-                    Ok($ok) => $use_ok,
-                    Err(why) => error!("could not parse {}: {}", stringify!($ok), why),
-                })
-            };
-        }
-
         if let Err(why) = self.connect_state.session.dealer().start().await {
             error!("starting dealer failed: {why}");
             return;
@@ -463,7 +210,6 @@ impl SpircTask {
 
         while !self.connect_state.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
-            let player_events = self.player_events.as_mut();
 
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
@@ -528,11 +274,6 @@ impl SpircTask {
                 cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => if let Some(cmd) = cmd {
                     if let Err(e) = self.handle_command(cmd).await {
                         debug!("could not dispatch command: {e}");
-                    }
-                },
-                event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
-                    if let Err(e) = self.handle_player_event(event) {
-                        error!("could not dispatch player event: {e}");
                     }
                 },
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
@@ -607,7 +348,9 @@ impl SpircTask {
 
         self.connect_state.session.dealer().close().await;
     }
+}
 
+impl CommanderTask {
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
@@ -645,50 +388,13 @@ impl SpircTask {
             false
         };
 
-        // Fire set queue event if context was successfully loaded
-        if update_state {
-            self.emit_set_queue_event();
-        }
+        // // Fire set queue event if context was successfully loaded
+        // if update_state {
+        //     self.emit_set_queue_event();
+        // }
 
         self.context_resolver.remove_used_and_invalid();
         update_state
-    }
-
-    /// Emit set queue event via PlayerEvent
-    fn emit_set_queue_event(&self) {
-        if !self.emit_set_queue_events {
-            return;
-        }
-
-        let state_player = self.connect_state.player();
-
-        let current_track = state_player.track.as_ref().map(|t| QueueTrack {
-            uri: t.uri.clone(),
-            provider: t.provider.clone(),
-        });
-
-        let next_tracks: Vec<_> = state_player
-            .next_tracks
-            .iter()
-            .map(|t| QueueTrack {
-                uri: t.uri.clone(),
-                provider: t.provider.clone(),
-            })
-            .collect();
-
-        let prev_tracks: Vec<_> = state_player
-            .prev_tracks
-            .iter()
-            .map(|t| QueueTrack {
-                uri: t.uri.clone(),
-                provider: t.provider.clone(),
-            })
-            .collect();
-
-        let context_uri = self.connect_state.context_uri().clone();
-
-        self.player
-            .emit_set_queue_event(context_uri, current_track, next_tracks, prev_tracks);
     }
 
     // todo: is the time_delta still necessary?
@@ -712,26 +418,25 @@ impl SpircTask {
                     rx.close()
                 }
             }
-            SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
-                let device_id = self.connect_state.session.device_id();
-                self.connect_state
-                    .session
-                    .spclient()
-                    .transfer(device_id, device_id, request.as_ref())
-                    .await?;
-                return Ok(());
-            }
-            SpircCommand::Activate if !self.connect_state.is_active() => {
-                trace!("Received SpircCommand::{cmd:?}");
-                self.handle_activate();
-                return self.notify().await;
-            }
-            SpircCommand::Transfer(..) | SpircCommand::Activate => {
-                warn!("SpircCommand::{cmd:?} will be ignored while already active")
-            }
-            _ if !self.connect_state.is_active() => {
-                warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
-            }
+            // SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
+            //     let device_id = self.session.device_id();
+            //     self.session
+            //         .spclient()
+            //         .transfer(device_id, device_id, request.as_ref())
+            //         .await?;
+            //     return Ok(());
+            // }
+            // SpircCommand::Activate if !self.connect_state.is_active() => {
+            //     trace!("Received SpircCommand::{cmd:?}");
+            //     self.handle_activate();
+            //     return self.notify().await;
+            // }
+            // SpircCommand::Transfer(..) | SpircCommand::Activate => {
+            //     warn!("SpircCommand::{cmd:?} will be ignored while already active")
+            // }
+            // _ if !self.connect_state.is_active() => {
+            //     warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
+            // }
             SpircCommand::Disconnect { pause } => {
                 if pause {
                     self.handle_pause()
@@ -750,145 +455,146 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            // SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
+            _ => unimplemented!()
         };
 
         self.notify().await
     }
 
-    fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
-        if let PlayerEvent::TrackChanged { audio_item } = event {
-            self.connect_state.update_duration(audio_item.duration_ms);
-            self.update_state = true;
-            return Ok(());
-        }
+    // fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
+    //     if let PlayerEvent::TrackChanged { audio_item } = event {
+    //         self.connect_state.update_duration(audio_item.duration_ms);
+    //         self.update_state = true;
+    //         return Ok(());
+    //     }
 
-        // update play_request_id
-        if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
-            self.play_request_id = Some(play_request_id);
-            return Ok(());
-        }
+    //     // update play_request_id
+    //     if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
+    //         self.play_request_id = Some(play_request_id);
+    //         return Ok(());
+    //     }
 
-        let is_current_track = matches! {
-            (event.get_play_request_id(), self.play_request_id),
-            (Some(event_id), Some(current_id)) if event_id == current_id
-        };
+    //     let is_current_track = matches! {
+    //         (event.get_play_request_id(), self.play_request_id),
+    //         (Some(event_id), Some(current_id)) if event_id == current_id
+    //     };
 
-        // we only process events if the play_request_id matches. If it doesn't, it is
-        // an event that belongs to a previous track and only arrives now due to a race
-        // condition. In this case we have updated the state already and don't want to
-        // mess with it.
-        if !is_current_track {
-            return Ok(());
-        }
+    //     // we only process events if the play_request_id matches. If it doesn't, it is
+    //     // an event that belongs to a previous track and only arrives now due to a race
+    //     // condition. In this case we have updated the state already and don't want to
+    //     // mess with it.
+    //     if !is_current_track {
+    //         return Ok(());
+    //     }
 
-        match event {
-            PlayerEvent::EndOfTrack { .. } => {
-                let next_track = self
-                    .connect_state
-                    .repeat_track()
-                    .then(|| self.connect_state.current_track(|t| t.uri.clone()));
+    //     match event {
+    //         PlayerEvent::EndOfTrack { .. } => {
+    //             let next_track = self
+    //                 .connect_state
+    //                 .repeat_track()
+    //                 .then(|| self.connect_state.current_track(|t| t.uri.clone()));
 
-                self.handle_next(next_track)?
-            }
-            PlayerEvent::Loading { .. } => match self.play_status {
-                SpircPlayStatus::LoadingPlay { position_ms } => {
-                    self.connect_state
-                        .update_position(position_ms, self.now_ms());
-                    trace!("==> LoadingPlay");
-                }
-                SpircPlayStatus::LoadingPause { position_ms } => {
-                    self.connect_state
-                        .update_position(position_ms, self.now_ms());
-                    trace!("==> LoadingPause");
-                }
-                _ => {
-                    self.connect_state.update_position(0, self.now_ms());
-                    trace!("==> Loading");
-                }
-            },
-            PlayerEvent::Seeked { position_ms, .. } => {
-                trace!("==> Seeked");
-                self.connect_state
-                    .update_position(position_ms, self.now_ms())
-            }
-            PlayerEvent::Playing { position_ms, .. }
-            | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                trace!("==> Playing");
-                let new_nominal_start_time = self.now_ms() - position_ms as i64;
-                match self.play_status {
-                    SpircPlayStatus::Playing {
-                        ref mut nominal_start_time,
-                        ..
-                    } => {
-                        if (*nominal_start_time - new_nominal_start_time).abs() > 100 {
-                            *nominal_start_time = new_nominal_start_time;
-                            self.connect_state
-                                .update_position(position_ms, self.now_ms());
-                        } else {
-                            return Ok(());
-                        }
-                    }
-                    SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                        self.connect_state
-                            .update_position(position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Playing {
-                            nominal_start_time: new_nominal_start_time,
-                            preloading_of_next_track_triggered: false,
-                        };
-                    }
-                    _ => return Ok(()),
-                }
-            }
-            PlayerEvent::Paused {
-                position_ms: new_position_ms,
-                ..
-            } => {
-                trace!("==> Paused");
-                match self.play_status {
-                    SpircPlayStatus::Paused { .. } | SpircPlayStatus::Playing { .. } => {
-                        self.connect_state
-                            .update_position(new_position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Paused {
-                            position_ms: new_position_ms,
-                            preloading_of_next_track_triggered: false,
-                        };
-                    }
-                    SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                        self.connect_state
-                            .update_position(new_position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Paused {
-                            position_ms: new_position_ms,
-                            preloading_of_next_track_triggered: false,
-                        };
-                    }
-                    _ => return Ok(()),
-                }
-            }
-            PlayerEvent::Stopped { .. } => {
-                trace!("==> Stopped");
-                match self.play_status {
-                    SpircPlayStatus::Stopped => return Ok(()),
-                    _ => self.play_status = SpircPlayStatus::Stopped,
-                }
-            }
-            PlayerEvent::TimeToPreloadNextTrack { .. } => {
-                self.handle_preload_next_track();
-                return Ok(());
-            }
-            PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
-                    self.handle_next(None)?
-                }
-            }
-            _ => return Ok(()),
-        }
+    //             self.handle_next(next_track)?
+    //         }
+    //         PlayerEvent::Loading { .. } => match self.play_status {
+    //             SpircPlayStatus::LoadingPlay { position_ms } => {
+    //                 self.connect_state
+    //                     .update_position(position_ms, self.now_ms());
+    //                 trace!("==> LoadingPlay");
+    //             }
+    //             SpircPlayStatus::LoadingPause { position_ms } => {
+    //                 self.connect_state
+    //                     .update_position(position_ms, self.now_ms());
+    //                 trace!("==> LoadingPause");
+    //             }
+    //             _ => {
+    //                 self.connect_state.update_position(0, self.now_ms());
+    //                 trace!("==> Loading");
+    //             }
+    //         },
+    //         PlayerEvent::Seeked { position_ms, .. } => {
+    //             trace!("==> Seeked");
+    //             self.connect_state
+    //                 .update_position(position_ms, self.now_ms())
+    //         }
+    //         PlayerEvent::Playing { position_ms, .. }
+    //         | PlayerEvent::PositionCorrection { position_ms, .. } => {
+    //             trace!("==> Playing");
+    //             let new_nominal_start_time = self.now_ms() - position_ms as i64;
+    //             match self.play_status {
+    //                 SpircPlayStatus::Playing {
+    //                     ref mut nominal_start_time,
+    //                     ..
+    //                 } => {
+    //                     if (*nominal_start_time - new_nominal_start_time).abs() > 100 {
+    //                         *nominal_start_time = new_nominal_start_time;
+    //                         self.connect_state
+    //                             .update_position(position_ms, self.now_ms());
+    //                     } else {
+    //                         return Ok(());
+    //                     }
+    //                 }
+    //                 SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
+    //                     self.connect_state
+    //                         .update_position(position_ms, self.now_ms());
+    //                     self.play_status = SpircPlayStatus::Playing {
+    //                         nominal_start_time: new_nominal_start_time,
+    //                         preloading_of_next_track_triggered: false,
+    //                     };
+    //                 }
+    //                 _ => return Ok(()),
+    //             }
+    //         }
+    //         PlayerEvent::Paused {
+    //             position_ms: new_position_ms,
+    //             ..
+    //         } => {
+    //             trace!("==> Paused");
+    //             match self.play_status {
+    //                 SpircPlayStatus::Paused { .. } | SpircPlayStatus::Playing { .. } => {
+    //                     self.connect_state
+    //                         .update_position(new_position_ms, self.now_ms());
+    //                     self.play_status = SpircPlayStatus::Paused {
+    //                         position_ms: new_position_ms,
+    //                         preloading_of_next_track_triggered: false,
+    //                     };
+    //                 }
+    //                 SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
+    //                     self.connect_state
+    //                         .update_position(new_position_ms, self.now_ms());
+    //                     self.play_status = SpircPlayStatus::Paused {
+    //                         position_ms: new_position_ms,
+    //                         preloading_of_next_track_triggered: false,
+    //                     };
+    //                 }
+    //                 _ => return Ok(()),
+    //             }
+    //         }
+    //         PlayerEvent::Stopped { .. } => {
+    //             trace!("==> Stopped");
+    //             match self.play_status {
+    //                 SpircPlayStatus::Stopped => return Ok(()),
+    //                 _ => self.play_status = SpircPlayStatus::Stopped,
+    //             }
+    //         }
+    //         PlayerEvent::TimeToPreloadNextTrack { .. } => {
+    //             self.handle_preload_next_track();
+    //             return Ok(());
+    //         }
+    //         PlayerEvent::Unavailable { track_id, .. } => {
+    //             self.handle_unavailable(&track_id)?;
+    //             if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
+    //                 self.handle_next(None)?
+    //             }
+    //         }
+    //         _ => return Ok(()),
+    //     }
 
-        self.update_state = true;
-        Ok(())
-    }
+    //     self.update_state = true;
+    //     Ok(())
+    // }
 
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
         trace!("Received connection ID update: {connection_id:?}");
@@ -922,19 +628,20 @@ impl SpircTask {
         } else if cluster.transfer_data.is_empty() {
             debug!("got empty transfer state, do nothing");
             return Ok(());
-        } else {
-            info!(
-                "trying to take over control automatically, session_id: {}",
-                cluster.player_state.session_id
-            )
         }
+        // else {
+        //     info!(
+        //         "trying to take over control automatically, session_id: {}",
+        //         cluster.player_state.session_id
+        //     )
+        // }
 
         use protobuf::Message;
 
-        match TransferState::parse_from_bytes(&cluster.transfer_data) {
-            Ok(transfer_state) => self.handle_transfer(transfer_state)?,
-            Err(why) => error!("failed to take over control: {why}"),
-        }
+        // match TransferState::parse_from_bytes(&cluster.transfer_data) {
+        //     Ok(transfer_state) => self.handle_transfer(transfer_state)?,
+        //     Err(why) => error!("failed to take over control: {why}"),
+        // }
 
         Ok(())
     }
@@ -970,17 +677,17 @@ impl SpircTask {
 
                 trace!("Received attribute mutation, {key} was {old_value} is now {new_value}");
 
-                if key == "filter-explicit-content" && new_value == "1" {
-                    self.player
-                        .emit_filter_explicit_content_changed_event(matches!(new_value, "1"));
-                }
+                // if key == "filter-explicit-content" && new_value == "1" {
+                //     self.player
+                //         .emit_filter_explicit_content_changed_event(matches!(new_value, "1"));
+                // }
 
-                if key == "autoplay" && old_value != new_value {
-                    self.player
-                        .emit_auto_play_changed_event(matches!(new_value, "1"));
+                // if key == "autoplay" && old_value != new_value {
+                //     self.player
+                //         .emit_auto_play_changed_event(matches!(new_value, "1"));
 
-                    self.add_autoplay_resolving_when_required()
-                }
+                //     self.add_autoplay_resolving_when_required()
+                // }
             } else {
                 trace!("Received attribute mutation for {key} but key was not found!");
             }
@@ -1045,11 +752,11 @@ impl SpircTask {
         use Command::*;
 
         match request.command {
-            // errors and unknown commands
-            Transfer(transfer) if transfer.data.is_none() => {
-                warn!("transfer endpoint didn't contain any data to transfer");
-                Err(SpircError::NoData)?
-            }
+            // // errors and unknown commands
+            // Transfer(transfer) if transfer.data.is_none() => {
+            //     warn!("transfer endpoint didn't contain any data to transfer");
+            //     Err(SpircError::NoData)?
+            // }
             Unknown(unknown) => Err(SpircError::UnknownEndpoint(unknown))?,
             // implicit update of the connect_state
             UpdateContext(update_context) => {
@@ -1069,57 +776,57 @@ impl SpircTask {
                 }
                 return Ok(());
             }
-            // modification and update of the connect_state
-            Transfer(transfer) => {
-                self.handle_transfer(transfer.data.expect("by condition checked"))?;
-                return self.notify().await;
-            }
+            // // modification and update of the connect_state
+            // Transfer(transfer) => {
+            //     self.handle_transfer(transfer.data.expect("by condition checked"))?;
+            //     return self.notify().await;
+            // }
             Play(mut play) => {
-                if !self.connect_state.is_active() {
-                    self.handle_activate()
-                }
+                // if !self.connect_state.is_active() {
+                //     self.handle_activate()
+                // }
 
-                let context = match play.context.uri {
-                    Some(s) => PlayContext::Uri(s),
-                    None if !play.context.pages.is_empty() => PlayContext::Tracks(
-                        play.context
-                            .pages
-                            .iter()
-                            .cloned()
-                            .flat_map(|p| p.tracks)
-                            .flat_map(|t| t.uri)
-                            .collect(),
-                    ),
-                    None => Err(SpircError::NoUri("context"))?,
-                };
+                // let context = match play.context.uri {
+                //     Some(s) => PlayContext::Uri(s),
+                //     None if !play.context.pages.is_empty() => PlayContext::Tracks(
+                //         play.context
+                //             .pages
+                //             .iter()
+                //             .cloned()
+                //             .flat_map(|p| p.tracks)
+                //             .flat_map(|t| t.uri)
+                //             .collect(),
+                //     ),
+                //     None => Err(SpircError::NoUri("context"))?,
+                // };
 
-                let context_options = play
-                    .options
-                    .player_options_override
-                    .map(Into::into)
-                    .map(LoadContextOptions::Options);
+                // let context_options = play
+                //     .options
+                //     .player_options_override
+                //     .map(Into::into)
+                //     .map(LoadContextOptions::Options);
 
-                let fallback_index = play
-                    .options
-                    .skip_to
-                    .as_ref()
-                    .and_then(|s| s.track_index)
-                    .map(|i| i as usize);
+                // let fallback_index = play
+                //     .options
+                //     .skip_to
+                //     .as_ref()
+                //     .and_then(|s| s.track_index)
+                //     .map(|i| i as usize);
 
-                self.handle_load(
-                    LoadRequest {
-                        context,
-                        options: LoadRequestOptions {
-                            start_playing: true,
-                            seek_to: play.options.seek_to.unwrap_or_default(),
-                            playing_track: play.options.skip_to.and_then(|s| s.try_into().ok()),
-                            context_options,
-                        },
-                    },
-                    play.context.pages.pop(),
-                    fallback_index,
-                )
-                .await?;
+                // self.handle_load(
+                //     LoadRequest {
+                //         context,
+                //         options: LoadRequestOptions {
+                //             start_playing: true,
+                //             seek_to: play.options.seek_to.unwrap_or_default(),
+                //             playing_track: play.options.skip_to.and_then(|s| s.try_into().ok()),
+                //             context_options,
+                //         },
+                //     },
+                //     play.context.pages.pop(),
+                //     fallback_index,
+                // )
+                // .await?;
 
                 self.connect_state.set_origin(play.play_origin)
             }
@@ -1136,11 +843,11 @@ impl SpircTask {
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             AddToQueue(add_to_queue) => {
                 self.connect_state.add_to_queue(add_to_queue.track, true);
-                self.emit_set_queue_event();
+                // self.emit_set_queue_event();
             }
             SetQueue(set_queue) => {
                 self.connect_state.handle_set_queue(set_queue);
-                self.emit_set_queue_event();
+                // self.emit_set_queue_event();
             }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
@@ -1162,133 +869,134 @@ impl SpircTask {
                 self.load_track(true, 0)?
             }
             Resume(_) => self.handle_play(),
+            _ => unimplemented!(),
         }
 
         self.update_state = true;
         Ok(())
     }
 
-    fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
-        let mut ctx_uri = match transfer.current_session.context.uri {
-            None => Err(SpircError::NoUri("transfer context"))?,
-            // can apparently happen when a state is transferred and was started with "uris" via the api
-            Some(ref uri) if uri == "-" || uri.is_empty() => None,
-            Some(ref uri) => Some(uri.clone()),
-        };
+    // fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+    //     let mut ctx_uri = match transfer.current_session.context.uri {
+    //         None => Err(SpircError::NoUri("transfer context"))?,
+    //         // can apparently happen when a state is transferred and was started with "uris" via the api
+    //         Some(ref uri) if uri == "-" || uri.is_empty() => None,
+    //         Some(ref uri) => Some(uri.clone()),
+    //     };
 
-        self.connect_state.reset_context(
-            ctx_uri
-                .as_deref()
-                .map(ResetContext::WhenDifferent)
-                .unwrap_or(ResetContext::Completely),
-        );
+    //     self.connect_state.reset_context(
+    //         ctx_uri
+    //             .as_deref()
+    //             .map(ResetContext::WhenDifferent)
+    //             .unwrap_or(ResetContext::Completely),
+    //     );
 
-        match self.connect_state.current_track_from_transfer(&transfer) {
-            Err(why) => warn!("didn't find initial track: {why}"),
-            Ok(track) => {
-                debug!("found initial track <{}>", track.uri);
-                self.connect_state.set_track(track)
-            }
-        };
+    //     match self.connect_state.current_track_from_transfer(&transfer) {
+    //         Err(why) => warn!("didn't find initial track: {why}"),
+    //         Ok(track) => {
+    //             debug!("found initial track <{}>", track.uri);
+    //             self.connect_state.set_track(track)
+    //         }
+    //     };
 
-        let autoplay = self.connect_state.current_track(|t| t.is_autoplay());
-        if autoplay {
-            ctx_uri = ctx_uri.map(|c| c.replace("station:", ""));
-        }
+    //     let autoplay = self.connect_state.current_track(|t| t.is_autoplay());
+    //     if autoplay {
+    //         ctx_uri = ctx_uri.map(|c| c.replace("station:", ""));
+    //     }
 
-        let fallback = self.connect_state.current_track(|t| &t.uri).clone();
-        let load_from_context_uri = ctx_uri.is_some();
+    //     let fallback = self.connect_state.current_track(|t| &t.uri).clone();
+    //     let load_from_context_uri = ctx_uri.is_some();
 
-        match ctx_uri {
-            Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
-                    uri.clone(),
-                    &fallback,
-                    ContextType::Default,
-                    ContextAction::Replace,
-                ));
-            }
-            None => {
-                let all_tracks = transfer
-                    .current_session
-                    .context
-                    .pages
-                    .iter()
-                    .cloned()
-                    .flat_map(|p| p.tracks)
-                    .collect::<Vec<_>>();
+    //     match ctx_uri {
+    //         Some(ref uri) => {
+    //             self.context_resolver.add(ResolveContext::from_uri(
+    //                 uri.clone(),
+    //                 &fallback,
+    //                 ContextType::Default,
+    //                 ContextAction::Replace,
+    //             ));
+    //         }
+    //         None => {
+    //             let all_tracks = transfer
+    //                 .current_session
+    //                 .context
+    //                 .pages
+    //                 .iter()
+    //                 .cloned()
+    //                 .flat_map(|p| p.tracks)
+    //                 .collect::<Vec<_>>();
 
-                if !all_tracks.is_empty() {
-                    self.load_context_from_tracks(all_tracks)?;
-                } else {
-                    warn!(
-                        "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
-                    );
-                    ctx_uri = Some(fallback.clone())
-                }
-            }
-        };
+    //             if !all_tracks.is_empty() {
+    //                 self.load_context_from_tracks(all_tracks)?;
+    //             } else {
+    //                 warn!(
+    //                     "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
+    //                 );
+    //                 ctx_uri = Some(fallback.clone())
+    //             }
+    //         }
+    //     };
 
-        self.handle_activate();
+    //     self.handle_activate();
 
-        let timestamp = self.now_ms();
-        let state = &mut self.connect_state;
-        state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
+    //     let timestamp = self.now_ms();
+    //     let state = &mut self.connect_state;
+    //     state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
 
-        // adjust active context, so resolve knows for which context it should set up the state
-        state.active_context = if autoplay {
-            ContextType::Autoplay
-        } else {
-            ContextType::Default
-        };
+    //     // adjust active context, so resolve knows for which context it should set up the state
+    //     state.active_context = if autoplay {
+    //         ContextType::Autoplay
+    //     } else {
+    //         ContextType::Default
+    //     };
 
-        // update position if the track continued playing
-        let transfer_timestamp = transfer.playback.timestamp.unwrap_or_default();
-        let position = match transfer.playback.position_as_of_timestamp {
-            Some(position) if transfer.playback.is_paused.unwrap_or_default() => position.into(),
-            // update position if the track continued playing
-            Some(position) if position > 0 => {
-                let time_since_position_update = timestamp - transfer_timestamp;
-                i64::from(position) + time_since_position_update
-            }
-            _ => 0,
-        };
+    //     // update position if the track continued playing
+    //     let transfer_timestamp = transfer.playback.timestamp.unwrap_or_default();
+    //     let position = match transfer.playback.position_as_of_timestamp {
+    //         Some(position) if transfer.playback.is_paused.unwrap_or_default() => position.into(),
+    //         // update position if the track continued playing
+    //         Some(position) if position > 0 => {
+    //             let time_since_position_update = timestamp - transfer_timestamp;
+    //             i64::from(position) + time_since_position_update
+    //         }
+    //         _ => 0,
+    //     };
 
-        let is_playing = !transfer.playback.is_paused();
+    //     let is_playing = !transfer.playback.is_paused();
 
-        if self.connect_state.current_track(|t| t.is_autoplay()) || autoplay {
-            if let Some(ctx_uri) = ctx_uri {
-                debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
-                self.context_resolver.add(ResolveContext::from_uri(
-                    ctx_uri,
-                    fallback,
-                    ContextType::Autoplay,
-                    ContextAction::Replace,
-                ))
-            } else {
-                warn!("couldn't resolve autoplay context without a context uri");
-            }
-        }
+    //     if self.connect_state.current_track(|t| t.is_autoplay()) || autoplay {
+    //         if let Some(ctx_uri) = ctx_uri {
+    //             debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
+    //             self.context_resolver.add(ResolveContext::from_uri(
+    //                 ctx_uri,
+    //                 fallback,
+    //                 ContextType::Autoplay,
+    //                 ContextAction::Replace,
+    //             ))
+    //         } else {
+    //             warn!("couldn't resolve autoplay context without a context uri");
+    //         }
+    //     }
 
-        if load_from_context_uri {
-            self.transfer_state = Some(transfer);
-        } else {
-            match self.connect_state.get_context(ContextType::Default) {
-                Err(why) => {
-                    warn!("continuing transfer in an unknown state. {why}");
-                    self.transfer_state = Some(transfer);
-                }
-                Ok(ctx) => {
-                    let idx = ConnectState::find_index_in_context(ctx, |pt| {
-                        self.connect_state.current_track(|t| pt.uri == t.uri)
-                    })?;
-                    self.connect_state.reset_playback_to_position(Some(idx))?;
-                }
-            }
-        }
+    //     if load_from_context_uri {
+    //         self.transfer_state = Some(transfer);
+    //     } else {
+    //         match self.connect_state.get_context(ContextType::Default) {
+    //             Err(why) => {
+    //                 warn!("continuing transfer in an unknown state. {why}");
+    //                 self.transfer_state = Some(transfer);
+    //             }
+    //             Ok(ctx) => {
+    //                 let idx = ConnectState::find_index_in_context(ctx, |pt| {
+    //                     self.connect_state.current_track(|t| pt.uri == t.uri)
+    //                 })?;
+    //                 self.connect_state.reset_playback_to_position(Some(idx))?;
+    //             }
+    //         }
+    //     }
 
-        self.load_track(is_playing, position.try_into()?)
-    }
+    //     self.load_track(is_playing, position.try_into()?)
+    // }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
@@ -1300,16 +1008,14 @@ impl SpircTask {
 
         self.connect_state.became_inactive().await?;
 
-        self.player.emit_session_disconnected_event(
-            self.connect_state.session.connection_id(),
-            self.connect_state.session.username(),
-        );
+        // self.player
+        //     .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
 
         Ok(())
     }
 
     fn handle_stop(&mut self) {
-        self.player.stop();
+        // self.player.stop();
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
 
@@ -1318,141 +1024,138 @@ impl SpircTask {
         }
     }
 
-    fn handle_activate(&mut self) {
-        self.connect_state.set_active(true);
-        self.player.emit_session_connected_event(
-            self.connect_state.session.connection_id(),
-            self.connect_state.session.username(),
-        );
-        self.player.emit_session_client_changed_event(
-            self.connect_state.session.client_id(),
-            self.connect_state.session.client_name(),
-            self.connect_state.session.client_brand_name(),
-            self.connect_state.session.client_model_name(),
-        );
+    // fn handle_activate(&mut self) {
+    //     self.connect_state.set_active(true);
+    //     self.player
+    //         .emit_session_connected_event(self.session.connection_id(), self.session.username());
+    //     self.player.emit_session_client_changed_event(
+    //         self.session.client_id(),
+    //         self.session.client_name(),
+    //         self.session.client_brand_name(),
+    //         self.session.client_model_name(),
+    //     );
 
-        self.player
-            .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
+    //     self.player
+    //         .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
 
-        self.player
-            .emit_auto_play_changed_event(self.connect_state.session.autoplay());
+    //     self.player
+    //         .emit_auto_play_changed_event(self.session.autoplay());
 
-        self.player.emit_filter_explicit_content_changed_event(
-            self.connect_state.session.filter_explicit_content(),
-        );
+    //     self.player
+    //         .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
 
-        self.player
-            .emit_shuffle_changed_event(self.connect_state.shuffling_context());
+    //     self.player
+    //         .emit_shuffle_changed_event(self.connect_state.shuffling_context());
 
-        self.player.emit_repeat_changed_event(
-            self.connect_state.repeat_context(),
-            self.connect_state.repeat_track(),
-        );
-    }
+    //     self.player.emit_repeat_changed_event(
+    //         self.connect_state.repeat_context(),
+    //         self.connect_state.repeat_track(),
+    //     );
+    // }
 
-    async fn handle_load(
-        &mut self,
-        cmd: LoadRequest,
-        page: Option<ContextPage>,
-        fallback_index: Option<usize>,
-    ) -> Result<(), Error> {
-        self.connect_state
-            .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
-                ResetContext::WhenDifferent(uri)
-            } else {
-                ResetContext::Completely
-            });
+    // async fn handle_load(
+    //     &mut self,
+    //     cmd: LoadRequest,
+    //     page: Option<ContextPage>,
+    //     fallback_index: Option<usize>,
+    // ) -> Result<(), Error> {
+    //     self.connect_state
+    //         .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
+    //             ResetContext::WhenDifferent(uri)
+    //         } else {
+    //             ResetContext::Completely
+    //         });
 
-        self.connect_state.reset_options();
+    //     self.connect_state.reset_options();
 
-        let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
-        match cmd.context {
-            PlayContext::Uri(uri) => {
-                self.load_context_from_uri(uri, page.as_ref(), autoplay)
-                    .await?
-            }
-            PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
-        }
+    //     let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
+    //     match cmd.context {
+    //         PlayContext::Uri(uri) => {
+    //             self.load_context_from_uri(uri, page.as_ref(), autoplay)
+    //                 .await?
+    //         }
+    //         PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
+    //     }
 
-        let cmd_options = cmd.options;
+    //     let cmd_options = cmd.options;
 
-        self.connect_state.set_active_context(ContextType::Default);
+    //     self.connect_state.set_active_context(ContextType::Default);
 
-        // for play commands with skip by uid, the context of the command contains
-        // tracks with uri and uid, so we merge the new context with the resolved/existing context
-        self.connect_state.merge_context(page);
+    //     // for play commands with skip by uid, the context of the command contains
+    //     // tracks with uri and uid, so we merge the new context with the resolved/existing context
+    //     self.connect_state.merge_context(page);
 
-        // load here, so that we clear the queue only after we definitely retrieved a new context
-        self.connect_state.clear_next_tracks();
-        self.connect_state.clear_restrictions();
+    //     // load here, so that we clear the queue only after we definitely retrieved a new context
+    //     self.connect_state.clear_next_tracks();
+    //     self.connect_state.clear_restrictions();
 
-        debug!("play track <{:?}>", cmd_options.playing_track);
+    //     debug!("play track <{:?}>", cmd_options.playing_track);
 
-        let index = match cmd_options.playing_track {
-            None => None,
-            Some(ref playing_track) => Some(match playing_track {
-                PlayingTrack::Index(i) => Ok(*i as usize),
-                PlayingTrack::Uri(uri) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
-                }
-                PlayingTrack::Uid(uid) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)
-                }
-            }),
-        }
-        .map(|i| {
-            i.unwrap_or_else(|why| {
-                warn!(
-                    "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
-                    cmd_options.playing_track, fallback_index
-                );
-                fallback_index.unwrap_or_default()
-            })
-        });
+    //     let index = match cmd_options.playing_track {
+    //         None => None,
+    //         Some(ref playing_track) => Some(match playing_track {
+    //             PlayingTrack::Index(i) => Ok(*i as usize),
+    //             PlayingTrack::Uri(uri) => {
+    //                 let ctx = self.connect_state.get_context(ContextType::Default)?;
+    //                 ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
+    //             }
+    //             PlayingTrack::Uid(uid) => {
+    //                 let ctx = self.connect_state.get_context(ContextType::Default)?;
+    //                 ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)
+    //             }
+    //         }),
+    //     }
+    //     .map(|i| {
+    //         i.unwrap_or_else(|why| {
+    //             warn!(
+    //                 "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
+    //                 cmd_options.playing_track, fallback_index
+    //             );
+    //             fallback_index.unwrap_or_default()
+    //         })
+    //     });
 
-        if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
-            debug!(
-                "loading with shuffle: <{}>, repeat track: <{}> context: <{}>",
-                options.shuffle, options.repeat, options.repeat_track
-            );
+    //     if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
+    //         debug!(
+    //             "loading with shuffle: <{}>, repeat track: <{}> context: <{}>",
+    //             options.shuffle, options.repeat, options.repeat_track
+    //         );
 
-            self.connect_state.set_shuffle(options.shuffle);
-            self.connect_state.set_repeat_context(options.repeat);
-            self.connect_state.set_repeat_track(options.repeat_track);
-        }
+    //         self.connect_state.set_shuffle(options.shuffle);
+    //         self.connect_state.set_repeat_context(options.repeat);
+    //         self.connect_state.set_repeat_track(options.repeat_track);
+    //     }
 
-        if matches!(cmd_options.context_options, Some(LoadContextOptions::Options(ref o)) if o.shuffle)
-        {
-            if let Some(index) = index {
-                self.connect_state.set_current_track(index)?;
-            } else {
-                self.connect_state.set_current_track_random()?;
-            }
+    //     if matches!(cmd_options.context_options, Some(LoadContextOptions::Options(ref o)) if o.shuffle)
+    //     {
+    //         if let Some(index) = index {
+    //             self.connect_state.set_current_track(index)?;
+    //         } else {
+    //             self.connect_state.set_current_track_random()?;
+    //         }
 
-            if self.context_resolver.has_next() {
-                self.connect_state.update_queue_revision()
-            } else {
-                self.connect_state.shuffle_new()?;
-                self.add_autoplay_resolving_when_required();
-            }
-        } else {
-            self.connect_state
-                .set_current_track(index.unwrap_or_default())?;
-            self.connect_state.reset_playback_to_position(index)?;
-            self.add_autoplay_resolving_when_required();
-        }
+    //         if self.context_resolver.has_next() {
+    //             self.connect_state.update_queue_revision()
+    //         } else {
+    //             self.connect_state.shuffle_new()?;
+    //             self.add_autoplay_resolving_when_required();
+    //         }
+    //     } else {
+    //         self.connect_state
+    //             .set_current_track(index.unwrap_or_default())?;
+    //         self.connect_state.reset_playback_to_position(index)?;
+    //         self.add_autoplay_resolving_when_required();
+    //     }
 
-        if self.connect_state.current_track(MessageField::is_some) {
-            self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
-        } else {
-            info!("No active track, stopping");
-            self.handle_stop()
-        }
+    //     if self.connect_state.current_track(MessageField::is_some) {
+    //         self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
+    //     } else {
+    //         info!("No active track, stopping");
+    //         self.handle_stop()
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     async fn load_context_from_uri(
         &mut self,
@@ -1460,9 +1163,9 @@ impl SpircTask {
         page: Option<&ContextPage>,
         autoplay: bool,
     ) -> Result<(), Error> {
-        if !self.connect_state.is_active() {
-            self.handle_activate();
-        }
+        // if !self.connect_state.is_active() {
+        //     self.handle_activate();
+        // }
 
         let update_context = if autoplay {
             ContextType::Autoplay
@@ -1516,7 +1219,7 @@ impl SpircTask {
             .connect_state
             .update_context(ctx, ContextType::Default)?;
 
-        self.emit_set_queue_event();
+        // self.emit_set_queue_event();
 
         Ok(())
     }
@@ -1527,7 +1230,7 @@ impl SpircTask {
                 position_ms,
                 preloading_of_next_track_triggered,
             } => {
-                self.player.play();
+                // self.player.play();
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Playing {
@@ -1536,16 +1239,16 @@ impl SpircTask {
                 };
             }
             SpircPlayStatus::LoadingPause { position_ms } => {
-                self.player.play();
+                // self.player.play();
                 self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
             }
-            _ => return,
+            _ => (),
         }
 
-        // Synchronize the volume from the mixer. This is useful on
-        // systems that can switch sources from and back to librespot.
-        let current_volume = self.mixer.volume();
-        self.set_volume(current_volume);
+        // // Synchronize the volume from the mixer. This is useful on
+        // // systems that can switch sources from and back to librespot.
+        // let current_volume = self.mixer.volume();
+        // self.set_volume(current_volume);
     }
 
     fn handle_play_pause(&mut self) {
@@ -1566,7 +1269,7 @@ impl SpircTask {
                 nominal_start_time,
                 preloading_of_next_track_triggered,
             } => {
-                self.player.pause();
+                // self.player.pause();
                 let position_ms = (self.now_ms() - nominal_start_time) as u32;
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
@@ -1576,7 +1279,7 @@ impl SpircTask {
                 };
             }
             SpircPlayStatus::LoadingPlay { position_ms } => {
-                self.player.pause();
+                // self.player.pause();
                 self.play_status = SpircPlayStatus::LoadingPause { position_ms };
             }
             _ => (),
@@ -1592,7 +1295,7 @@ impl SpircTask {
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
-        self.player.seek(position_ms);
+        // self.player.seek(position_ms);
         let now = self.now_ms();
         match self.play_status {
             SpircPlayStatus::Stopped => (),
@@ -1614,19 +1317,19 @@ impl SpircTask {
     }
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
-        self.player.emit_shuffle_changed_event(shuffle);
+        // self.player.emit_shuffle_changed_event(shuffle);
         self.connect_state.handle_shuffle(shuffle)
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
-        self.player
-            .emit_repeat_changed_event(repeat, self.connect_state.repeat_track());
+        // self.player
+        //     .emit_repeat_changed_event(repeat, self.connect_state.repeat_track());
         self.connect_state.handle_set_repeat_context(repeat)
     }
 
     fn handle_repeat_track(&mut self, repeat: bool) {
-        self.player
-            .emit_repeat_changed_event(self.connect_state.repeat_context(), repeat);
+        // self.player
+        //     .emit_repeat_changed_event(self.connect_state.repeat_context(), repeat);
         self.connect_state.set_repeat_track(repeat);
     }
 
@@ -1663,37 +1366,37 @@ impl SpircTask {
             };
             self.connect_state.add_to_queue(track, true);
         }
-        self.emit_set_queue_event();
+        // self.emit_set_queue_event();
     }
 
-    fn handle_preload_next_track(&mut self) {
-        // Requests the player thread to preload the next track
-        match self.play_status {
-            SpircPlayStatus::Paused {
-                ref mut preloading_of_next_track_triggered,
-                ..
-            }
-            | SpircPlayStatus::Playing {
-                ref mut preloading_of_next_track_triggered,
-                ..
-            } => {
-                *preloading_of_next_track_triggered = true;
-            }
-            _ => (),
-        }
+    // fn handle_preload_next_track(&mut self) {
+    //     // Requests the player thread to preload the next track
+    //     match self.play_status {
+    //         SpircPlayStatus::Paused {
+    //             ref mut preloading_of_next_track_triggered,
+    //             ..
+    //         }
+    //         | SpircPlayStatus::Playing {
+    //             ref mut preloading_of_next_track_triggered,
+    //             ..
+    //         } => {
+    //             *preloading_of_next_track_triggered = true;
+    //         }
+    //         _ => (),
+    //     }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
-        }
-    }
+    //     if let Some(track_id) = self.connect_state.preview_next_track() {
+    //         self.player.preload(track_id);
+    //     }
+    // }
 
-    // Mark unavailable tracks so we can skip them later
-    fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
-        self.connect_state.mark_unavailable(track_id)?;
-        self.handle_preload_next_track();
+    // // Mark unavailable tracks so we can skip them later
+    // fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
+    //     self.connect_state.mark_unavailable(track_id)?;
+    //     self.handle_preload_next_track();
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     fn add_autoplay_resolving_when_required(&mut self) {
         let require_load_new = !self
@@ -1897,7 +1600,7 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        // self.player.load(id, start_playing, position_ms);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -1929,23 +1632,24 @@ impl SpircTask {
 
         let old_volume = self.connect_state.device_info().volume;
         let new_volume = volume as u32;
-        if old_volume != new_volume || self.mixer.volume() != volume {
+        if old_volume != new_volume {
+            // || self.mixer.volume() != volume {
             self.update_volume = true;
 
             self.connect_state.set_volume(new_volume);
-            self.mixer.set_volume(volume);
+            // self.mixer.set_volume(volume);
             if let Some(cache) = self.connect_state.session.cache() {
                 cache.save_volume(volume)
             }
-            if self.connect_state.is_active() {
-                self.player.emit_volume_changed_event(volume);
-            }
+            // if self.connect_state.is_active() {
+            //     self.player.emit_volume_changed_event(volume);
+            // }
         }
     }
 }
 
-impl Drop for SpircTask {
+impl Drop for CommanderTask {
     fn drop(&mut self) {
-        debug!("drop Spirc[{}]", self.spirc_id);
+        debug!("drop Spirc[{}]", self.id);
     }
 }

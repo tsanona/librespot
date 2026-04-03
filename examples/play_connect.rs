@@ -12,6 +12,7 @@ use librespot::{
     },
 };
 
+use librespot_connect::PlayerTask;
 use log::LevelFilter;
 
 const CACHE: &str = ".cache";
@@ -60,7 +61,7 @@ async fn main() -> Result<(), Error> {
     );
 
     let (spirc, spirc_task) =
-        Spirc::new(connect_config, session.clone(), credentials, player, mixer).await?;
+        Spirc::<PlayerTask>::new_with_player(connect_config, session.clone(), credentials, player, mixer).await?;
 
     // these calls can be seen as "queued"
     spirc.activate()?;

@@ -10,12 +10,10 @@ use librespot_protocol as protocol;
 
 mod context_resolver;
 mod model;
-mod observer;
 mod shuffle_vec;
 mod spirc;
 mod state;
 
 pub use model::*;
-pub use observer::*;
 pub use spirc::*;
 pub use state::*;

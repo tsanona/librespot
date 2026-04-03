@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use librespot::connect::Spirc;
+use librespot_connect::PlayerTask;
 use log::{error, info, warn};
 use std::{
     env,
@@ -44,7 +45,7 @@ async fn main() {
 
     let setup = get_setup().await;
 
-    let mut spirc: Option<Spirc> = None;
+    let mut spirc: Option<Spirc<PlayerTask>> = None;
     let mut spirc_task: Option<_> = None;
     let mut auto_connect_times: Vec<Instant> = vec![];
     let mut connecting = false;

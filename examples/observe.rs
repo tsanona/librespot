@@ -1,11 +1,11 @@
 use std::process::exit;
 
 use librespot::{
-    connect::{ConnectConfig, Observer},
-    discovery::DeviceType,
+    connect::{ConnectConfig, ObserverTask, Spirc},
     core::{
         Error, authentication::Credentials, cache::Cache, config::SessionConfig, session::Session,
     },
+    discovery::DeviceType,
 };
 
 use log::LevelFilter;
@@ -20,7 +20,12 @@ async fn main() -> Result<(), Error> {
         .init();
 
     let session_config = SessionConfig::default();
-    let connect_config = ConnectConfig { name: String::from("test_observer"), device_type: DeviceType::Observer, can_play: false, ..Default::default() };
+    let connect_config = ConnectConfig {
+        name: String::from("test_observer"),
+        device_type: DeviceType::Observer,
+        can_play: false,
+        ..Default::default()
+    };
 
     let cache = Cache::new(Some(CACHE), Some(CACHE), Some(CACHE_FILES), None)?;
     let credentials = cache
@@ -41,13 +46,13 @@ async fn main() -> Result<(), Error> {
     let session = Session::new(session_config, Some(cache));
 
     let (mut observer, observer_task) =
-        Observer::new(connect_config, session.clone(), credentials).await?;
+        Spirc::<ObserverTask>::new(connect_config, session.clone(), credentials).await?;
 
     let mut observer_task = Box::pin(observer_task);
 
     loop {
         tokio::select! {
-            Some(change) = observer.changes.recv() => {
+            Some(change) = observer.recv() => {
                 println!("Got server update: {:?}", change.update_reason);
             }
             _ = observer_task.as_mut() => {

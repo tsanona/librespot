@@ -155,7 +155,7 @@ pub(super) struct ConnectState {
 }
 
 impl ConnectState {
-    pub fn new(cfg: ConnectConfig, session: &Session) -> Self {
+    pub fn new(cfg: ConnectConfig, session: Session) -> Self {
         let volume_step_size = u16::MAX.checked_div(cfg.volume_steps).unwrap_or(1024);
 
         let device_info = DeviceInfo {
@@ -213,7 +213,6 @@ impl ConnectState {
         };
 
         let mut state = Self {
-            session: session.clone(),
             request: PutStateRequest {
                 member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
                 put_state_reason: EnumOrUnknown::new(PutStateReason::PLAYER_STATE_CHANGED),
@@ -227,6 +226,7 @@ impl ConnectState {
                 }),
                 ..Default::default()
             },
+            session,
             unavailable_uri: Default::default(),
             active_since: Default::default(),
             queue_count: Default::default(),

@@ -18,7 +18,7 @@ use librespot::{
         player::{coefficient_to_duration, duration_to_coefficient},
     },
 };
-use librespot_connect::Spirc;
+use librespot_connect::{PlayerTask, Spirc};
 use librespot_discovery::Discovery;
 use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::{mixer::Mixer, player::Player};
@@ -352,12 +352,12 @@ impl Setup {
         player: Arc<Player>,
         mixer: Arc<dyn Mixer>,
     ) -> (
-        Option<Spirc>,
+        Option<Spirc<PlayerTask>>,
         Option<Pin<Box<impl Future<Output = ()> + 'static>>>,
     ) {
         let connect_config = self.connect_config.clone();
         let (spirc_, spirc_task_) =
-            match Spirc::new(connect_config, session, credentials, player, mixer).await {
+            match Spirc::new_with_player(connect_config, session, credentials, player, mixer).await {
                 Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
                 Err(e) => {
                     error!("could not initialize spirc: {e}");
