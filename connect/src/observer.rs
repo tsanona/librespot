@@ -1,18 +1,11 @@
 use crate::{
     core::{
-        authentication::Credentials,
-        dealer::{
-            manager::BoxedStreamResult,
-            protocol::Message,
-        },
         Error, Session,
+        authentication::Credentials,
+        dealer::{manager::BoxedStreamResult, protocol::Message},
     },
-    protocol::{
-        connect::{Cluster, ClusterUpdate},
-    },
-    state::{
-        {ConnectConfig, ConnectState},
-    },
+    protocol::connect::{Cluster, ClusterUpdate},
+    state::{ConnectConfig, ConnectState},
 };
 use futures_util::StreamExt;
 use std::{
@@ -43,8 +36,6 @@ struct ObserverTask {
     task_id: usize,
 
     connection_id_update: BoxedStreamResult<String>,
-
-    session: Session,
 
     /// the state management object
     connect_state: ConnectState,
@@ -111,12 +102,10 @@ impl Observer {
 
             connection_id_update,
 
-            session,
-
             connect_state,
             connect_state_update,
 
-            changes: chngs_tx
+            changes: chngs_tx,
         };
 
         let observer = Observer { changes: chngs_rx };
@@ -146,12 +135,12 @@ impl ObserverTask {
             };
         }
 
-        if let Err(why) = self.session.dealer().start().await {
+        if let Err(why) = self.connect_state.session.dealer().start().await {
             error!("starting dealer failed: {why}");
             return;
         }
 
-        while !self.session.is_invalid() {
+        while !self.connect_state.session.is_invalid() {
             tokio::select! {
                 // startup of the dealer requires a connection_id, which is retrieved at the very beginning
                 connection_id_update = self.connection_id_update.next() => unwrap! {
@@ -172,20 +161,16 @@ impl ObserverTask {
             }
         }
 
-        self.session.dealer().close().await;
+        self.connect_state.session.dealer().close().await;
     }
 
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
         trace!("Received connection ID update: {:?}", connection_id);
-        self.session.set_connection_id(&connection_id);
+        self.connect_state.session.set_connection_id(&connection_id);
 
         use protobuf::Message;
 
-        let cluster = match self
-            .connect_state
-            .notify_new_device_appeared(&self.session)
-            .await
-        {
+        let cluster = match self.connect_state.notify_new_device_appeared().await {
             Ok(res) => Cluster::parse_from_bytes(&res).ok(),
             Err(why) => {
                 error!("{why:?}");
@@ -196,10 +181,11 @@ impl ObserverTask {
 
         debug!(
             "successfully put connect state for {} with connection-id {connection_id}",
-            self.session.device_id()
+            self.connect_state.session.device_id()
         );
 
-        let same_session = cluster.player_state.session_id == self.session.session_id()
+        let same_session = cluster.player_state.session_id
+            == self.connect_state.session.session_id()
             || cluster.player_state.session_id.is_empty();
         if !cluster.active_device_id.is_empty() || !same_session {
             info!(
@@ -220,10 +206,7 @@ impl ObserverTask {
         Ok(())
     }
 
-    async fn handle_cluster_update(
-        &mut self,
-        cluster_update: ClusterUpdate,
-    ) -> Result<(), Error> {
+    async fn handle_cluster_update(&mut self, cluster_update: ClusterUpdate) -> Result<(), Error> {
         let reason = cluster_update.update_reason.enum_value();
         let device_ids = cluster_update.devices_that_changed.join(", ");
         debug!(

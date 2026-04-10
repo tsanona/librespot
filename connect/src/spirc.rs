@@ -98,7 +98,6 @@ struct SpircTask {
     emit_set_queue_events: bool,
 
     shutdown: bool,
-    session: Session,
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
@@ -255,7 +254,6 @@ impl Spirc {
             emit_set_queue_events,
 
             shutdown: false,
-            session,
 
             transfer_state: None,
             update_volume: false,
@@ -458,12 +456,12 @@ impl SpircTask {
             };
         }
 
-        if let Err(why) = self.session.dealer().start().await {
+        if let Err(why) = self.connect_state.session.dealer().start().await {
             error!("starting dealer failed: {why}");
             return;
         }
 
-        while !self.session.is_invalid() && !self.shutdown {
+        while !self.connect_state.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
 
@@ -548,7 +546,7 @@ impl SpircTask {
                     self.update_volume = false;
 
                     info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
-                    if let Err(why) = self.connect_state.notify_volume_changed(&self.session).await {
+                    if let Err(why) = self.connect_state.notify_volume_changed().await {
                         error!("error updating connect state for volume update: {why}")
                     }
 
@@ -597,11 +595,17 @@ impl SpircTask {
         }
 
         // this should clear the active session id, leaving an empty state
-        if let Err(why) = self.session.spclient().delete_connect_state_request().await {
+        if let Err(why) = self
+            .connect_state
+            .session
+            .spclient()
+            .delete_connect_state_request()
+            .await
+        {
             error!("error during connect state deletion: {why}")
         };
 
-        self.session.dealer().close().await;
+        self.connect_state.session.dealer().close().await;
     }
 
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
@@ -693,7 +697,7 @@ impl SpircTask {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|err| err.duration());
 
-        dur.as_millis() as i64 + 1000 * self.session.time_delta()
+        dur.as_millis() as i64 + 1000 * self.connect_state.session.time_delta()
     }
 
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
@@ -709,8 +713,9 @@ impl SpircTask {
                 }
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
-                let device_id = self.session.device_id();
-                self.session
+                let device_id = self.connect_state.session.device_id();
+                self.connect_state
+                    .session
                     .spclient()
                     .transfer(device_id, device_id, request.as_ref())
                     .await?;
@@ -887,13 +892,9 @@ impl SpircTask {
 
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
         trace!("Received connection ID update: {connection_id:?}");
-        self.session.set_connection_id(&connection_id);
+        self.connect_state.session.set_connection_id(&connection_id);
 
-        let cluster = match self
-            .connect_state
-            .notify_new_device_appeared(&self.session)
-            .await
-        {
+        let cluster = match self.connect_state.notify_new_device_appeared().await {
             Ok(res) => Cluster::parse_from_bytes(&res).ok(),
             Err(why) => {
                 error!("{why:?}");
@@ -904,12 +905,13 @@ impl SpircTask {
 
         debug!(
             "successfully put connect state for {} with connection-id {connection_id}",
-            self.session.device_id()
+            self.connect_state.session.device_id()
         );
 
         self.connect_established = true;
 
-        let same_session = cluster.player_state.session_id == self.session.session_id()
+        let same_session = cluster.player_state.session_id
+            == self.connect_state.session.session_id()
             || cluster.player_state.session_id.is_empty();
         if !cluster.active_device_id.is_empty() || !same_session {
             info!(
@@ -944,25 +946,27 @@ impl SpircTask {
             .iter()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
-        self.session.set_user_attributes(attributes)
+        self.connect_state.session.set_user_attributes(attributes)
     }
 
     fn handle_user_attributes_mutation(&mut self, mutation: UserAttributesMutation) {
         for attribute in mutation.fields.iter() {
             let key = &attribute.name;
 
-            if key == "autoplay" && self.session.config().autoplay.is_some() {
+            if key == "autoplay" && self.connect_state.session.config().autoplay.is_some() {
                 trace!("Autoplay override active. Ignoring mutation.");
                 continue;
             }
 
-            if let Some(old_value) = self.session.user_data().attributes.get(key) {
+            if let Some(old_value) = self.connect_state.session.user_data().attributes.get(key) {
                 let new_value = match old_value.as_ref() {
                     "0" => "1",
                     "1" => "0",
                     _ => old_value,
                 };
-                self.session.set_user_attribute(key, new_value);
+                self.connect_state
+                    .session
+                    .set_user_attribute(key, new_value);
 
                 trace!("Received attribute mutation, {key} was {old_value} is now {new_value}");
 
@@ -997,7 +1001,7 @@ impl SpircTask {
 
         if let Some(cluster) = cluster_update.cluster.take() {
             let became_inactive = self.connect_state.is_active()
-                && cluster.active_device_id != self.session.device_id();
+                && cluster.active_device_id != self.connect_state.session.device_id();
             if became_inactive {
                 info!("device became inactive");
                 self.handle_disconnect().await?;
@@ -1009,7 +1013,7 @@ impl SpircTask {
                 self.update_state = true;
             }
         } else if self.connect_state.is_active() {
-            self.connect_state.became_inactive(&self.session).await?;
+            self.connect_state.became_inactive().await?;
         }
 
         Ok(())
@@ -1294,10 +1298,12 @@ impl SpircTask {
             .update_position_in_relation(self.now_ms());
         self.notify().await?;
 
-        self.connect_state.became_inactive(&self.session).await?;
+        self.connect_state.became_inactive().await?;
 
-        self.player
-            .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
+        self.player.emit_session_disconnected_event(
+            self.connect_state.session.connection_id(),
+            self.connect_state.session.username(),
+        );
 
         Ok(())
     }
@@ -1314,23 +1320,26 @@ impl SpircTask {
 
     fn handle_activate(&mut self) {
         self.connect_state.set_active(true);
-        self.player
-            .emit_session_connected_event(self.session.connection_id(), self.session.username());
+        self.player.emit_session_connected_event(
+            self.connect_state.session.connection_id(),
+            self.connect_state.session.username(),
+        );
         self.player.emit_session_client_changed_event(
-            self.session.client_id(),
-            self.session.client_name(),
-            self.session.client_brand_name(),
-            self.session.client_model_name(),
+            self.connect_state.session.client_id(),
+            self.connect_state.session.client_name(),
+            self.connect_state.session.client_brand_name(),
+            self.connect_state.session.client_model_name(),
         );
 
         self.player
             .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
 
         self.player
-            .emit_auto_play_changed_event(self.session.autoplay());
+            .emit_auto_play_changed_event(self.connect_state.session.autoplay());
 
-        self.player
-            .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
+        self.player.emit_filter_explicit_content_changed_event(
+            self.connect_state.session.filter_explicit_content(),
+        );
 
         self.player
             .emit_shuffle_changed_event(self.connect_state.shuffling_context());
@@ -1625,7 +1634,13 @@ impl SpircTask {
         let track_uris: Vec<String> = match uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => vec![uri.to_uri()],
             SpotifyUri::Album { .. } | SpotifyUri::Playlist { .. } => {
-                match self.session.spclient().get_context(&uri.to_uri()).await {
+                match self
+                    .connect_state
+                    .session
+                    .spclient()
+                    .get_context(&uri.to_uri())
+                    .await
+                {
                     Ok(context) => context
                         .pages
                         .iter()
@@ -1684,7 +1699,7 @@ impl SpircTask {
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
-            && self.session.autoplay()
+            && self.connect_state.session.autoplay()
             && !self.connect_state.context_uri().is_empty();
 
         if !require_load_new {
@@ -1832,16 +1847,19 @@ impl SpircTask {
         };
 
         let active_device = session.host_active_device_id.take();
-        if matches!(active_device, Some(ref device) if device == self.session.device_id()) {
+        if matches!(active_device, Some(ref device) if device == self.connect_state.session.device_id())
+        {
             info!(
                 "session update: <{:?}> for self, current session_id {}, new session_id {}",
                 reason,
-                self.session.session_id(),
+                self.connect_state.session.session_id(),
                 session.session_id
             );
 
-            if self.session.session_id() != session.session_id {
-                self.session.set_session_id(&session.session_id);
+            if self.connect_state.session.session_id() != session.session_id {
+                self.connect_state
+                    .session
+                    .set_session_id(&session.session_id);
                 self.connect_state.set_session_id(session.session_id);
             }
         } else {
@@ -1903,10 +1921,7 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        self.connect_state
-            .send_state(&self.session)
-            .await
-            .map(|_| ())
+        self.connect_state.send_state().await.map(|_| ())
     }
 
     fn set_volume(&mut self, volume: u16) {
@@ -1919,7 +1934,7 @@ impl SpircTask {
 
             self.connect_state.set_volume(new_volume);
             self.mixer.set_volume(volume);
-            if let Some(cache) = self.session.cache() {
+            if let Some(cache) = self.connect_state.session.cache() {
                 cache.save_volume(volume)
             }
             if self.connect_state.is_active() {

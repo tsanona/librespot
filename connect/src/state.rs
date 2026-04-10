@@ -123,8 +123,11 @@ impl ConnectConfig {
     }
 }
 
-#[derive(Default, Debug)]
+// #[derive(Default, Debug)]
 pub(super) struct ConnectState {
+    /// pointer to associated session.
+    pub session: Session,
+
     /// the entire state that is updated to the remote server
     request: PutStateRequest,
 
@@ -210,6 +213,7 @@ impl ConnectState {
         };
 
         let mut state = Self {
+            session: session.clone(),
             request: PutStateRequest {
                 member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
                 put_state_reason: EnumOrUnknown::new(PutStateReason::PLAYER_STATE_CHANGED),
@@ -223,8 +227,15 @@ impl ConnectState {
                 }),
                 ..Default::default()
             },
+            unavailable_uri: Default::default(),
+            active_since: Default::default(),
+            queue_count: Default::default(),
+            active_context: Default::default(),
+            fill_up_context: Default::default(),
+            context: Default::default(),
+            transfer_shuffle: Default::default(),
+            autoplay_context: Default::default(),
             volume_step_size,
-            ..Default::default()
         };
         state.reset();
         state
@@ -474,42 +485,39 @@ impl ConnectState {
         player.timestamp = timestamp;
     }
 
-    pub async fn became_inactive(&mut self, session: &Session) -> SpClientResult {
+    pub async fn became_inactive(&mut self) -> SpClientResult {
         self.reset();
         self.reset_context(ResetContext::Completely);
 
-        session.spclient().put_connect_state_inactive(false).await
+        self.session
+            .spclient()
+            .put_connect_state_inactive(false)
+            .await
     }
 
-    async fn send_with_reason(
-        &mut self,
-        session: &Session,
-        reason: PutStateReason,
-    ) -> SpClientResult {
+    async fn send_with_reason(&mut self, reason: PutStateReason) -> SpClientResult {
         let prev_reason = self.request.put_state_reason;
 
         self.request.put_state_reason = EnumOrUnknown::new(reason);
-        let res = self.send_state(session).await;
+        let res = self.send_state().await;
 
         self.request.put_state_reason = prev_reason;
         res
     }
 
     /// Notifies the remote server about a new device
-    pub async fn notify_new_device_appeared(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::NEW_DEVICE)
-            .await
+    pub async fn notify_new_device_appeared(&mut self) -> SpClientResult {
+        self.send_with_reason(PutStateReason::NEW_DEVICE).await
     }
 
     /// Notifies the remote server about a new volume
-    pub async fn notify_volume_changed(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::VOLUME_CHANGED)
-            .await
+    pub async fn notify_volume_changed(&mut self) -> SpClientResult {
+        self.send_with_reason(PutStateReason::VOLUME_CHANGED).await
     }
 
-    /// Sends the connect state for the connect session to the remote server
-    pub async fn send_state(&self, session: &Session) -> SpClientResult {
-        session
+    /// Sends the connect state to the remote server
+    pub async fn send_state(&self) -> SpClientResult {
+        self.session
             .spclient()
             .put_connect_state_request(&self.request)
             .await
